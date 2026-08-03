@@ -113,17 +113,54 @@ Force push measures what the remote will *lose*, not just gain — and pins it t
 
 ```console
 $ termaxa report
-┌─ Termaxa Execution Report ─────────────────────────
-│ commands  : 4   ✓ 1 allow · ? 2 ask · ✗ 1 deny
-│ blocked   : ✗ psql -d shop -c "DROP TABLE users"
-│ impact    : • DROP users ~50,000 rows, 3 dependent(s)
-│            • plan: +3 ~0 -1
-│ backups   : 1 — rollback available
-│ risk      : Medium  (deny×3 + escalation×2 + ask×1 = 5)
-└──────────────────────────────────────────────────
+
+Session   session a3f8c21
+──────────────────────────────────────────
+Duration            18 min
+Commands            4   ✓ 1 · ? 2 · ✗ 1
+Previews            2
+Backups             1
+Rollbacks           0
+
+Destructive intents
+──────────────────────────────────────────
+db-destroy          1
+file-delete         3
+breaker trips       1
+
+Insight
+──────────────────────────────────────────
+The breaker blocked file-delete 3 times in this scope.
+
+This often indicates:
+- generated files being cleaned
+- build/output directories
+- an agent retry loop
+
+If this work is intentional, add an explicit allow rule
+scoped to the paths involved — relaxation is deliberate.
+
+Recent events
+──────────────────────────────────────────
+? git push --force origin main
+✗ psql -d shop -c "DROP TABLE users"
+✓ cargo test
+
+Backups   : 1 — rollback available (`termaxa backups`)
+Risk      : Medium  (deny×3 + escalation×2 + ask×1 = 5)
+
+Last 30 days
+──────────────────────────────────────────
+Sessions        12
+Commands        341
+Decisions       ✓ 302 · ? 31 · ✗ 8
+Breaker trips   3
 ```
 
-Every line is a fact with a source in the audit log. Nothing invented.
+One command, no flags: what the agent tried, what got blocked, what's
+recoverable — plus a 30-day view. Every line is a fact with a source in the
+audit log. Nothing invented, nothing collected: the report reads the local
+append-only log, makes no network calls, and sends no telemetry.
 
 ## Why Termaxa?
 
@@ -205,7 +242,7 @@ notify:                          # optional
 | `termaxa log [--decision D] [--source S] [--json]` | the audit trail |
 | `termaxa stats` | totals, sessions, top blocked |
 | `termaxa backups` · `termaxa rollback <id>` | list / restore backups |
-| `termaxa report [--session ID] [--all] [--md]` | session summary |
+| `termaxa report [--session ID] [--all] [--days N] [--md]` | session summary + rollup |
 | `termaxa notify --test` | verify your webhook |
 | `termaxa paths` | where policy and state live |
 
@@ -226,7 +263,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model.
 
 ## Contributing
 
-Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is ~3,600 lines of dependency-light Rust — `src/policy.rs` and `src/preview.rs` are the best places to start reading.
+Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is ~4,500 lines of dependency-light Rust — `src/policy.rs` and `src/preview.rs` are the best places to start reading.
 
 ## License
 
