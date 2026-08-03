@@ -95,6 +95,9 @@ enum Cmd {
         /// Report over all activity, not just the latest session
         #[arg(long)]
         all: bool,
+        /// Rollup window in days for the "Last N days" section
+        #[arg(long, default_value_t = 30)]
+        days: u64,
         /// Emit markdown instead of the terminal box
         #[arg(long)]
         md: bool,
@@ -238,8 +241,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let entries: Vec<_> = log
                 .read_last(100_000)?
                 .into_iter()
-                .filter(|e| decision.as_deref().map_or(true, |d| e.decision == d))
-                .filter(|e| source.as_deref().map_or(true, |s| e.source == s))
+                .filter(|e| decision.as_deref().is_none_or(|d| e.decision == d))
+                .filter(|e| source.as_deref().is_none_or(|s| e.source == s))
                 .collect();
             let skip = entries.len().saturating_sub(n);
             let entries: Vec<_> = entries.into_iter().skip(skip).collect();
@@ -328,7 +331,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 *denied.entry(e.command.as_str()).or_default() += 1;
             }
             let mut top: Vec<_> = denied.into_iter().collect();
-            top.sort_by(|a, b| b.1.cmp(&a.1));
+            top.sort_by_key(|t| std::cmp::Reverse(t.1));
             if !top.is_empty() {
                 println!("top denied :");
                 for (cmd, n) in top.into_iter().take(5) {
@@ -352,9 +355,14 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Report { session, all, md } => {
+        Cmd::Report {
+            session,
+            all,
+            days,
+            md,
+        } => {
             let p = paths::resolve()?;
-            report::run(&p, report::Scope { session, all }, md)
+            report::run(&p, report::Scope { session, all, days }, md)
         }
         Cmd::Paths => {
             let p = paths::resolve()?;

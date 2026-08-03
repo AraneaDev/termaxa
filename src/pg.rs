@@ -5,9 +5,9 @@ use std::process::Command;
 ///
 /// Two tiers, degrading gracefully:
 ///   1. STATIC  — parse the SQL out of a `psql ... -c "..."` command and
-///                identify destructive statements (no database needed).
+///      identify destructive statements (no database needed).
 ///   2. LIVE    — reuse the command's own connection arguments to run
-///                read-only introspection: row estimates + FK dependents.
+///      read-only introspection: row estimates + FK dependents.
 ///
 /// The preview NEVER executes the analyzed statement and NEVER runs anything
 /// but SELECTs against system catalogs. Row counts are planner estimates
@@ -302,7 +302,7 @@ fn extract_sql(tokens: &[String]) -> Option<String> {
 /// Deliberately conservative: recognizes common shapes, returns nothing
 /// when unsure. A missing preview is safe; the policy layer still applies.
 pub fn parse_destructive(sql: &str) -> Vec<Destructive> {
-    sql.split(';').filter_map(|stmt| parse_one(stmt)).collect()
+    sql.split(';').filter_map(parse_one).collect()
 }
 
 fn parse_one(stmt: &str) -> Option<Destructive> {
@@ -409,7 +409,7 @@ fn group_thousands(n: i64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

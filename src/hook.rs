@@ -34,7 +34,6 @@ pub struct ParsedHook {
 }
 
 /// Raw JSON in -> normalized hook event out. None = not for us; step aside.
-
 /// Normalize a URI-style path to a native one.
 /// Cursor emits workspace roots like "/c:/Users/User/code/proj" on Windows;
 /// convert to "c:/Users/User/code/proj" (which Rust's Path handles fine).
