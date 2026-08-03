@@ -2,6 +2,40 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.12.0 — the flight recorder
+
+`termaxa report` becomes the answer to "what actually happened while my agent
+was working?" — one command, no flags needed.
+
+### Added
+- **Destructive-intent breakdown.** Commands the classifier recognised,
+  grouped by intent (file-delete, db-destroy, git-destructive, infra-destroy),
+  with circuit-breaker trips shown as a separate line. Classified ≠ blocked,
+  and the report now says so.
+- **Insight.** When the breaker blocks the same intent repeatedly (≥3 in
+  scope), the report names the usual causes — generated files, build
+  directories, an agent retry loop — and suggests an explicit allow rule if
+  the work is intentional. Diagnostic, not scolding: policy relaxation stays
+  deliberate. Suggested by a reader in #4.
+- **Recent events.** The last six decisions with their marks, so the report
+  reads as a narrative rather than a stat block.
+- **Last N days rollup.** Sessions, commands, decisions, backups, breaker
+  trips, and top projects by working directory. `--days N` to change the
+  window (default 30).
+- Previews, backups, and rollbacks surfaced as first-class counts.
+
+### Fixed
+- Post-execution receipts rendered with the ✗ (denied) mark. An executed,
+  insured command is a success; it now shows ✓.
+
+### Notes
+- Everything here is derived from the existing append-only audit log. No new
+  state, no schema change, no telemetry — the report reads what Termaxa
+  already wrote locally.
+- Token/cost accounting is deliberately **not** included: that requires the
+  agent's own transcripts, and estimating it would put an invented number in
+  an audit tool. Tracked separately.
+
 ## [0.11.4] — Cursor 3.11 hook compatibility + post-execution receipts
 - **Fix (important): restore gating for Cursor 3.11+.** Cursor renamed its hook
   API (`preToolUse`/`postToolUse`, `tool_name:"Shell"`); Termaxa only knew the
