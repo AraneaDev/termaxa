@@ -95,22 +95,19 @@ struct Report {
     /// attempts, not merely repeated destructive work.
     trips_by_intent: Vec<(String, usize)>,
     /// Last N audit lines as (mark, command) for the "Recent events" section.
-    recent: Vec<(&'static str, String)>,
+    /// Mark is a String because it may carry ANSI colour (see `ui::mark`).
+    recent: Vec<(String, String)>,
     risk_score: u32,
     risk_label: &'static str,
 }
 
 /// Map a decision (and source) to a terminal mark.
-/// Fixes the post-receipt bug: an executed/post record is a success (✓),
-/// not a denial (✗). Anything else falls back to its decision.
-fn mark_for(decision: &str, source: &str) -> &'static str {
-    match (decision, source) {
-        (_, "post") => "✓", // post-execution receipt = it ran, insured
-        ("allow", _) => "✓",
-        ("ask", _) => "?",
-        ("deny", _) => "✗",
-        _ => "•",
-    }
+///
+/// Delegates to `ui::mark` so every surface agrees on both the glyph and the
+/// colour, and so the post-receipt rule lives in exactly one place: an
+/// executed/post record is a success (✓), not a denial (✗).
+fn mark_for(decision: &str, source: &str) -> String {
+    crate::ui::mark(decision, source)
 }
 
 fn compute(entries: &[&AuditEntry], paths: &Paths) -> Result<Report> {
@@ -181,7 +178,7 @@ fn compute(entries: &[&AuditEntry], paths: &Paths) -> Result<Report> {
     trips_by_intent.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     // Recent events: last 6 entries in scope, with corrected marks.
-    let recent: Vec<(&'static str, String)> = entries
+    let recent: Vec<(String, String)> = entries
         .iter()
         .rev()
         .take(6)
@@ -325,12 +322,24 @@ fn insight_for(label: &str) -> Option<Vec<&'static str>> {
 fn print_terminal(r: &Report, roll: &Rollup, session: Option<&str>) {
     let line = "──────────────────────────────────────────";
 
-    println!("\nSession   {}", session.map(short).unwrap_or_default());
-    println!("{}", line);
+    use crate::ui::{amber, bold, dim, green, red};
+
+    println!(
+        "\n{}   {}",
+        bold("Session"),
+        dim(&session.map(short).unwrap_or_default())
+    );
+    println!("{}", dim(line));
     println!("Duration            {} min", r.duration_min);
     println!(
-        "Commands            {}   ✓ {} · ? {} · ✗ {}",
-        r.total, r.allow, r.ask, r.deny
+        "Commands            {}   {} {} · {} {} · {} {}",
+        r.total,
+        green("✓"),
+        r.allow,
+        amber("?"),
+        r.ask,
+        red("✗"),
+        r.deny
     );
     println!("Escalated           {}", r.escalated);
     println!("Auto-flow           {}", r.auto_flow);
@@ -342,8 +351,8 @@ fn print_terminal(r: &Report, roll: &Rollup, session: Option<&str>) {
     // These are different numbers: a legitimate `rm -rf ./build` is an intent,
     // not a trip. Keeping them apart keeps the report honest.
     if !r.intents.is_empty() {
-        println!("\nDestructive intents");
-        println!("{}", line);
+        println!("\n{}", bold("Destructive intents"));
+        println!("{}", dim(line));
         for (label, count) in &r.intents {
             println!("{:<20}{}", label, count);
         }
@@ -354,8 +363,8 @@ fn print_terminal(r: &Report, roll: &Rollup, session: Option<&str>) {
     if let Some((label, count)) = r.trips_by_intent.first() {
         if *count >= INSIGHT_THRESHOLD {
             if let Some(causes) = insight_for(label) {
-                println!("\nInsight");
-                println!("{}", line);
+                println!("\n{}", bold(&amber("Insight")));
+                println!("{}", dim(line));
                 println!(
                     "The breaker blocked {} {} times in this scope.",
                     label, count
@@ -374,8 +383,8 @@ fn print_terminal(r: &Report, roll: &Rollup, session: Option<&str>) {
 
     // Recent events.
     if !r.recent.is_empty() {
-        println!("\nRecent events");
-        println!("{}", line);
+        println!("\n{}", bold("Recent events"));
+        println!("{}", dim(line));
         for (mark, cmd) in &r.recent {
             println!("{} {}", mark, cmd);
         }
@@ -394,24 +403,38 @@ fn print_terminal(r: &Report, roll: &Rollup, session: Option<&str>) {
             println!("  🛟 [{}] {}", kind, note);
         }
     }
+    let risk_coloured = match r.risk_label {
+        "Low" => green(r.risk_label),
+        "Medium" => amber(r.risk_label),
+        _ => red(r.risk_label),
+    };
     println!(
-        "Risk      : {}  (deny×3 + escalation×2 + ask×1 = {})",
-        r.risk_label, r.risk_score
+        "Risk      : {}  {}",
+        risk_coloured,
+        dim(&format!(
+            "(deny×3 + escalation×2 + ask×1 = {})",
+            r.risk_score
+        ))
     );
 
     // Rollup.
-    println!("\nLast {} days", roll.days);
-    println!("{}", line);
+    println!("\n{}", bold(&format!("Last {} days", roll.days)));
+    println!("{}", dim(line));
     println!("Sessions        {}", roll.sessions);
     println!("Commands        {}", roll.commands);
     println!(
-        "Decisions       ✓ {} · ? {} · ✗ {}",
-        roll.allow, roll.ask, roll.deny
+        "Decisions       {} {} · {} {} · {} {}",
+        green("✓"),
+        roll.allow,
+        amber("?"),
+        roll.ask,
+        red("✗"),
+        roll.deny
     );
     println!("Backups         {}", roll.backups);
     println!("Breaker trips   {}", roll.breaker_trips);
     if !roll.top_projects.is_empty() {
-        println!("\nTop projects");
+        println!("\n{}", bold("Top projects"));
         for p in &roll.top_projects {
             println!("  {}", p);
         }
@@ -513,12 +536,14 @@ mod tests {
     fn post_receipt_renders_as_success_not_denial() {
         // The v0.11.4 post-execution receipt bug: an executed command was
         // rendering with the ✗ mark because its decision was still "ask".
-        assert_eq!(mark_for("ask", "post"), "✓");
-        assert_eq!(mark_for("deny", "post"), "✓");
+        // `contains` rather than `assert_eq!` because the mark may carry ANSI
+        // colour depending on whether stdout is a terminal.
+        assert!(mark_for("ask", "post").contains('✓'));
+        assert!(mark_for("deny", "post").contains('✓'));
         // Normal marks unaffected.
-        assert_eq!(mark_for("allow", "hook"), "✓");
-        assert_eq!(mark_for("ask", "hook"), "?");
-        assert_eq!(mark_for("deny", "hook"), "✗");
+        assert!(mark_for("allow", "hook").contains('✓'));
+        assert!(mark_for("ask", "hook").contains('?'));
+        assert!(mark_for("deny", "hook").contains('✗'));
     }
 
     #[test]

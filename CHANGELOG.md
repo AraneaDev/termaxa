@@ -2,6 +2,49 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.13.0 — the first sixty seconds
+
+Activation release: what a developer sees between `cargo install` and their
+first intercepted command.
+
+### Added
+- **Welcome screen.** Bare `termaxa` now prints five lines and one runnable
+  command instead of clap's help wall. The challenge (`termaxa check "rm -rf /"`)
+  works with zero setup.
+- **`termaxa doctor`.** Is the gate actually wired up? Reports binary, policy,
+  which agents are detected and whether their hooks are configured, which
+  preview tools are on PATH, and state — ending with a numbered fix list.
+  Reports "configured", never "will fire": if an agent is wired but no hook
+  entries exist, it says so and points at `TERMAXA_HOOK_DEBUG`, which is the
+  diagnostic that would have caught the Cursor 3.11 silent-ungating in minutes.
+  Read-only by construction (see below).
+- **Colour across `check`, `report`, `log`, `stats`, and `backups`** —
+  dependency-free ANSI behind a gate that respects `NO_COLOR`,
+  `TERMAXA_NO_COLOR`, `CLICOLOR_FORCE`, and real TTY detection on Unix
+  *and* Windows.
+
+### Fixed
+- `termaxa log` rendered post-execution receipts with the ✗ (denied) mark —
+  the same bug fixed in `report` in v0.12, now sharing one implementation so
+  every surface agrees.
+- Column alignment when labels are colourised (padding counted escape bytes,
+  producing `commandrm -rf /`). Found by live testing; pinned by a test that
+  strips ANSI before asserting.
+- Windows TTY detection: redirected output no longer contains escape
+  sequences.
+
+### Changed
+- `paths::resolve_readonly` — a diagnostic must observe, never mutate.
+  `termaxa doctor` no longer creates the state directories it reports on, and
+  cannot trigger legacy migration.
+
+### Notes
+- No new dependencies. Colour is raw ANSI; Windows TTY detection is two FFI
+  declarations rather than a crate.
+- On Windows PowerShell 5.1, `>` redirection writes UTF-16 and mangles
+  Unicode glyphs. That's the shell, not Termaxa — use PowerShell 7, or
+  `termaxa report --md | Out-File -Encoding utf8 report.md`.
+  
 ## v0.12.0 — the flight recorder
 
 `termaxa report` becomes the answer to "what actually happened while my agent

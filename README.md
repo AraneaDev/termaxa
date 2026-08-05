@@ -34,7 +34,8 @@ Termaxa is a third option: a gate the agent's commands pass through. It reads a 
 
 ```bash
 cargo install termaxa
-termaxa check "rm -rf /"     # works immediately — no setup, no project config
+termaxa                       # what this is, and what to try next
+termaxa check "rm -rf /"      # works immediately — no setup, no project config
 ```
 
 **2. Wire up a project.**
@@ -42,6 +43,7 @@ termaxa check "rm -rf /"     # works immediately — no setup, no project config
 ```bash
 cd your-project
 termaxa init --claude-code      # writes .termaxa/policy.yaml, installs the Claude Code hook
+termaxa doctor                  # confirm it's actually wired up
 ```
 
 **3. See it work.**
@@ -58,8 +60,8 @@ From now on, every Bash command Claude Code runs in this project passes through 
 
 ```console
 $ termaxa check "git status && rm -rf /"
-decision: deny
-reason  : segment 2/2 `rm -rf /` — Recursive delete from root is blocked.
+decision  deny
+reason    segment 2/2 `rm -rf /` — Recursive delete from root is blocked.
 ```
 
 Termaxa splits compound commands and judges each part. `git status &&` buys nothing.
@@ -68,9 +70,10 @@ Termaxa splits compound commands and judges each part. `git status &&` buys noth
 
 ```console
 $ termaxa check "psql -d shop -c 'DROP TABLE users'"
-decision: deny
-reason  : DROP TABLE is blocked. Archive or rename instead.
-preview : postgres impact
+decision  deny
+reason    DROP TABLE is blocked. Archive or rename instead.
+
+postgres impact
   DROP TABLE users
     rows (estimate) : 50,000
     referenced by   : audit_log, orders, sessions (3 tables)
@@ -109,6 +112,43 @@ $ termaxa rollback b-1783006590625
 
 Force push measures what the remote will *lose*, not just gain — and pins it to a backup branch first.
 
+### Is it actually wired up?
+
+The failure mode nobody warns you about: the hook is installed, the agent doesn't call it, and everything looks fine. `termaxa doctor` answers the question directly.
+
+```console
+$ termaxa doctor
+
+Termaxa doctor
+──────────────────────────────────────────
+✓ termaxa 0.13.0
+  /home/you/.cargo/bin/termaxa
+
+Policy
+✓ /home/you/project/.termaxa/policy.yaml
+  38 rule(s), default ask
+
+Agents
+✓ Claude Code   hook configured
+! Cursor        detected, hook NOT configured
+    termaxa init --cursor
+
+Preview support
+✓ git         force-push previews and git backups
+✓ psql        Postgres blast radius
+· terraform   plan previews unavailable
+
+State
+✓ /home/you/.termaxa/projects/project-aae9b64c
+  412 audit entries (388 from hooks)
+
+──────────────────────────────────────────
+! 1 to fix:
+  · wire Cursor — `termaxa init --cursor`
+```
+
+It reports what it can verify: a hook is **configured**, never that it *fires*. If an agent is wired but no hook entries exist in the log, doctor says so and points you at `TERMAXA_HOOK_DEBUG` — because agents rename their hook APIs, and when they do, the gate fails open and silent (see [Honest limitations](#honest-limitations)). Doctor is read-only: it never creates the state it reports on.
+
 ### After a session: the report
 
 ```console
@@ -117,15 +157,17 @@ $ termaxa report
 Session   session a3f8c21
 ──────────────────────────────────────────
 Duration            18 min
-Commands            4   ✓ 1 · ? 2 · ✗ 1
-Previews            2
-Backups             1
+Commands            41   ✓ 34 · ? 6 · ✗ 1
+Escalated           2
+Auto-flow           34
+Previews            4
+Backups             3
 Rollbacks           0
 
 Destructive intents
 ──────────────────────────────────────────
+file-delete         5
 db-destroy          1
-file-delete         3
 breaker trips       1
 
 Insight
@@ -133,9 +175,9 @@ Insight
 The breaker blocked file-delete 3 times in this scope.
 
 This often indicates:
-- generated files being cleaned
-- build/output directories
-- an agent retry loop
+• generated files being cleaned
+• build/output directories
+• an agent retry loop
 
 If this work is intentional, add an explicit allow rule
 scoped to the paths involved — relaxation is deliberate.
@@ -146,21 +188,26 @@ Recent events
 ✗ psql -d shop -c "DROP TABLE users"
 ✓ cargo test
 
-Backups   : 1 — rollback available (`termaxa backups`)
-Risk      : Medium  (deny×3 + escalation×2 + ask×1 = 5)
+Backups   : 3 — rollback available (`termaxa backups`)
+Risk      : Medium  (deny×3 + escalation×2 + ask×1 = 9)
 
 Last 30 days
 ──────────────────────────────────────────
 Sessions        12
 Commands        341
 Decisions       ✓ 302 · ? 31 · ✗ 8
+Backups         19
 Breaker trips   3
+
+Top projects
+  backend-api
+  termaxa
+  website
 ```
 
-One command, no flags: what the agent tried, what got blocked, what's
-recoverable — plus a 30-day view. Every line is a fact with a source in the
-audit log. Nothing invented, nothing collected: the report reads the local
-append-only log, makes no network calls, and sends no telemetry.
+One command, no flags: what the agent tried, what got blocked, what's recoverable — plus a 30-day view. Note that *destructive intents* and *breaker trips* are separate numbers: a legitimate `rm -rf ./build` is a classified intent, not a trip.
+
+Every line is a fact with a source in the audit log. Nothing invented, nothing collected: the report reads the local append-only log, makes no network calls, and sends no telemetry.
 
 ## Why Termaxa?
 
@@ -168,9 +215,9 @@ append-only log, makes no network calls, and sends no telemetry.
 
 The built-in prompt tells you the *command*. Termaxa tells you the *consequence*: 50,000 rows, 3 dependent tables, 1 commit lost. It takes the backup **before** you approve, and when it blocks something it tells the model *why*, so the agent proposes an alternative instead of retrying.
 
-**Why not a sandbox / Docker?**
+**Why not a sandbox / Docker / Claude Code's `/sandbox`?**
 
-A sandbox contains damage *to the sandbox*. But your repo, your database, and your Terraform state are exactly the real things an agent must touch to be useful. Sandboxes are walls; Termaxa is a windshield. They're complementary — run both.
+A sandbox contains damage *to the sandbox*. But your repo, your database, and your Terraform state are exactly the real things an agent must touch to be useful — and a sandbox's default write scope *is* your working directory. Containment, consequence, and recovery are three different questions: sandboxes answer the first, Termaxa answers the second and third. They're complementary — run both. ([Longer version.](https://termaxa.com/blog/claude-code-sandbox))
 
 **Why not OPA / policy engines?**
 
@@ -235,16 +282,20 @@ notify:                          # optional
 
 | Command | Purpose |
 |---|---|
+| `termaxa` | what this is, and what to try next |
 | `termaxa init [--claude-code]` | scaffold `.termaxa/`, detect tools, install the hook |
+| `termaxa doctor` | is the gate wired up? binary, policy, agents, tools, state |
 | `termaxa check "<cmd>"` | dry-run: verdict + preview (exit 0/3/4) |
 | `termaxa run -- <cmd>` | gated execution: preview → approve → backup → run |
-| `termaxa hook` | Claude Code PreToolUse mode (stdin JSON → decision) |
+| `termaxa hook` | agent hook mode (stdin JSON → decision) |
 | `termaxa log [--decision D] [--source S] [--json]` | the audit trail |
 | `termaxa stats` | totals, sessions, top blocked |
 | `termaxa backups` · `termaxa rollback <id>` | list / restore backups |
 | `termaxa report [--session ID] [--all] [--days N] [--md]` | session summary + rollup |
 | `termaxa notify --test` | verify your webhook |
 | `termaxa paths` | where policy and state live |
+
+Colour is on when output is a terminal and off when it isn't. `NO_COLOR`, `TERMAXA_NO_COLOR`, and `CLICOLOR_FORCE` are all respected.
 
 ## Honest limitations
 
@@ -253,17 +304,20 @@ Termaxa is pre-1.0. It's real and tested, and it is not magic. Specifically:
 - **Hooks advise; they don't enforce.** Termaxa gates commands an agent submits through the Claude Code or Cursor hook. Those agents are *cooperative* — they respect a `deny` and propose an alternative, which is what makes the gate work. An agent running in full-auto mode could, in principle, retry a blocked action through a different command or shell; the circuit breaker raises the cost of that, but a hook is an *integration* point for visibility and policy, not an *enforcement* boundary. True enforcement means owning the execution path — that's **Termaxa Runtime**, on the roadmap. For hard guarantees today, pair Termaxa with OS-level sandboxing.
 - **Native agent tools bypass the gate.** The hook sees *shell* commands. An agent's own built-in file/edit tools don't go through the shell — observed in live testing, a Cursor agent switched to its native file-delete tool and removed files Termaxa never saw. Non-shell tool calls need OS-level isolation underneath.
 - **Cooperative, not a sandbox.** Termaxa governs commands that flow through the agent hook or `termaxa run`. An agent with raw, unhooked shell access is *not* contained — that needs OS-level sandboxing, a complementary layer. The threat model is *agents making expensive mistakes*, not a malicious agent actively evading you.
-- **Shell parsing is good, not perfect.** It splits on `&&`, `||`, `;`, `|` and flags `$(...)`. Subshells `( )`, deeply nested quoting, and variable-expanded commands are judged conservatively, not deeply understood.
+- **Shell parsing is good, not perfect.** It splits on `&&`, `||`, `;`, `|` and flags `$(...)`. Subshells `( )`, deeply nested quoting, and variable-expanded commands are judged conservatively, not deeply understood. In particular, a path built from a variable (`rm -rf ~/x/$SID`) is evaluated as written — if the variable expands to empty at runtime, the real blast radius is wider than the command string suggests.
 - **Previews are best-effort.** No database connection → static analysis only. Terraform previews shell out to `terraform plan`. Remote Terraform state is versioned by its backend, not by Termaxa.
 - **Backups have edges.** `rm` insurance keys on the literal `rm` command. Postgres backups use `pg_dump`/`psql` and must be on your PATH. No retention/pruning yet — backups accumulate.
 - **The format may still change.** Pre-1.0 means the policy schema and CLI can shift between minor versions. Pin a release.
 - **Claude Code and Cursor are live-tested.** Both are exercised end-to-end, including the circuit breaker tripping under a real Cursor session. Codex and Copilot dialects parse each agent's format but aren't verified end-to-end yet. Help validating them is welcome.
+- **Windows PowerShell 5.1 mangles redirected Unicode.** `termaxa report > out.txt` writes UTF-16 and garbles the box-drawing glyphs. That's the shell, not Termaxa — use PowerShell 7, or `termaxa report --md | Out-File -Encoding utf8 report.md`.
 
 See [SECURITY.md](SECURITY.md) for the full threat model.
 
 ## Contributing
 
-Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is ~4,500 lines of dependency-light Rust — `src/policy.rs` and `src/preview.rs` are the best places to start reading.
+Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is ~5,500 lines of dependency-light Rust — `src/policy.rs` and `src/preview.rs` are the best places to start reading.
+
+If you can make an agent get past the gate in a way that isn't already documented above, that's the most useful contribution you can make: [open an issue](https://github.com/termaxa/termaxa/issues) or email security@termaxa.com.
 
 ## License
 

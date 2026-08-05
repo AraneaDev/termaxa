@@ -352,7 +352,7 @@ fn print_hook_snippet() {
     );
 }
 
-fn which(bin: &str) -> bool {
+pub(crate) fn which(bin: &str) -> bool {
     // `which` on Unix, `where` on Windows
     let finder = if cfg!(windows) { "where" } else { "which" };
     Command::new(finder)

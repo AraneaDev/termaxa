@@ -24,6 +24,12 @@ impl Paths {
     pub fn policy_file(&self) -> PathBuf {
         self.project_dir.join("policy.yaml")
     }
+
+    /// The audit log's location. Does NOT create anything — callers that
+    /// intend to write go through `AuditLog::new`, which does.
+    pub fn log_file(&self) -> PathBuf {
+        self.state_dir.join("logs").join("audit.jsonl")
+    }
 }
 
 /// Resolve paths for the current project, creating state dirs and running
@@ -36,18 +42,35 @@ pub fn resolve() -> Result<Paths> {
 /// Resolve paths starting the policy search from an EXPLICIT directory, rather
 /// than the process cwd. Hooks use this with the agent-supplied payload `cwd`
 /// so they never depend on where the agent happened to spawn the process.
+///
+/// This variant has SIDE EFFECTS by design: it creates the state directories
+/// and runs one-time legacy migration, because every caller is about to write
+/// (evaluate, log, back up). Diagnostics must use `resolve_readonly`.
 pub fn resolve_from(start: &std::path::Path) -> Result<Paths> {
+    let paths = resolve_readonly(start)?;
+
+    fs::create_dir_all(paths.state_dir.join("logs"))?;
+    fs::create_dir_all(paths.state_dir.join("backups"))?;
+
+    migrate_legacy_state(&paths.project_dir, &paths.state_dir)?;
+
+    Ok(paths)
+}
+
+/// Compute where things live WITHOUT touching the filesystem.
+///
+/// `termaxa doctor` must observe, never mutate: a diagnostic that creates
+/// directories (or silently migrates legacy state) changes the thing it was
+/// asked to describe, and on a project that has never run an agent it would
+/// manufacture the very state it is reporting on. Path computation only —
+/// no `create_dir_all`, no migration.
+pub fn resolve_readonly(start: &std::path::Path) -> Result<Paths> {
     let Some(policy_file) = Policy::find_policy_file(start) else {
         bail!("no .termaxa/policy.yaml found in this directory or any parent — run `termaxa init` first");
     };
     let project_dir = policy_file.parent().unwrap().to_path_buf();
     let project_root = project_dir.parent().unwrap_or(&project_dir).to_path_buf();
-
     let state_dir = state_dir_for(&project_root)?;
-    fs::create_dir_all(state_dir.join("logs"))?;
-    fs::create_dir_all(state_dir.join("backups"))?;
-
-    migrate_legacy_state(&project_dir, &state_dir)?;
 
     Ok(Paths {
         project_dir,
@@ -262,6 +285,8 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn hash_key_stable_across_path_representations() {
         // The exact Windows/Cursor mismatch: backslash+uppercase vs slash+lowercase.
@@ -299,8 +324,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(&base);
     }
-
-    use super::*;
 
     #[test]
     fn hash_is_stable_and_distinguishes() {
@@ -348,6 +371,41 @@ mod tests {
             "explicit resolve_from(project cwd) must find the policy"
         );
         assert_eq!(r.unwrap().policy_file(), aegis.join("policy.yaml"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_readonly_creates_nothing() {
+        // A diagnostic must not manufacture the state it reports on.
+        // `termaxa doctor` runs on projects that have never executed anything;
+        // if resolving created logs/ and backups/, the report would describe
+        // directories it had just invented.
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("tmx-ro-{}", std::process::id()));
+        let proj = tmp.join("proj");
+        fs::create_dir_all(proj.join(".termaxa")).unwrap();
+        fs::write(
+            proj.join(".termaxa").join("policy.yaml"),
+            "version: 1\ndefault: ask\nrules: []\n",
+        )
+        .unwrap();
+        std::env::set_var("TERMAXA_HOME", tmp.join("home"));
+
+        let p = resolve_readonly(&proj).expect("must resolve without creating anything");
+        assert!(
+            !p.state_dir.join("logs").exists(),
+            "resolve_readonly must not create logs/"
+        );
+        assert!(
+            !p.state_dir.join("backups").exists(),
+            "resolve_readonly must not create backups/"
+        );
+
+        // ...while the writing variant does create them.
+        let p2 = resolve_from(&proj).expect("resolve_from must succeed");
+        assert!(p2.state_dir.join("logs").is_dir());
+        assert!(p2.state_dir.join("backups").is_dir());
 
         let _ = fs::remove_dir_all(&tmp);
     }

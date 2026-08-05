@@ -1,6 +1,7 @@
 mod audit;
 mod backup;
 mod context;
+mod doctor;
 mod hook;
 mod init;
 mod intent;
@@ -12,6 +13,7 @@ mod preview;
 mod report;
 mod runner;
 mod shell;
+mod ui;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -22,11 +24,11 @@ use policy::Policy;
     name = "termaxa",
     version,
     about = "Execution gate for AI coding agents: policy, previews, automatic backups, audit",
-    after_help = "EXAMPLES:\n  termaxa init --claude-code       wire up Claude Code (also: --cursor --codex --copilot)\n  termaxa check \"git push --force\"  dry-run a command against policy\n  termaxa run -- terraform apply     gated execution with preview + backup\n  termaxa log --decision deny        what got blocked\n  termaxa report                     summarize the last AI session\n\nDOCS: https://github.com/termaxa/termaxa"
+    after_help = "EXAMPLES:\n  termaxa init --claude-code       wire up Claude Code (also: --cursor --codex --copilot)\n  termaxa doctor                     is the gate actually wired up?\n  termaxa check \"git push --force\"  dry-run a command against policy\n  termaxa run -- terraform apply     gated execution with preview + backup\n  termaxa log --decision deny        what got blocked\n  termaxa report                     summarize the last AI session\n\nDOCS: https://github.com/termaxa/termaxa"
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Cmd,
+    command: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -46,6 +48,8 @@ enum Cmd {
         #[arg(long = "copilot")]
         copilot: bool,
     },
+    /// Check whether Termaxa is actually wired up and able to see commands
+    Doctor,
     /// Evaluate a command against policy without running it
     Check {
         /// The command string, e.g. "git push --force origin main"
@@ -125,7 +129,15 @@ fn main() {
 }
 
 fn dispatch(cli: Cli) -> Result<i32> {
-    match cli.command {
+    // Bare `termaxa` prints the welcome screen, not clap's help wall. The
+    // first thing a new user types after installing is the binary name; five
+    // lines and one runnable command teach more than a list of flags.
+    let Some(command) = cli.command else {
+        ui::welcome(env!("CARGO_PKG_VERSION"));
+        return Ok(0);
+    };
+
+    match command {
         Cmd::Init {
             claude_code,
             cursor,
@@ -141,6 +153,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
             )?;
             Ok(0)
         }
+        Cmd::Doctor => {
+            let dir = std::env::current_dir()?;
+            doctor::run(&dir)
+        }
         Cmd::Check { command } => {
             let cmd = command.join(" ");
             if cmd.trim().is_empty() {
@@ -154,10 +170,16 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let (policy, state_dir) = match &resolved {
                 Some(p) => (Policy::load(&p.policy_file())?, p.state_dir.clone()),
                 None => {
-                    eprintln!("ℹ Demo mode — no project policy found.");
-                    eprintln!("ℹ Using Termaxa's built-in starter policy (read-only).");
+                    eprintln!("{}", ui::dim("ℹ Demo mode — no project policy found."));
                     eprintln!(
-                        "ℹ Run `termaxa init` to create a policy you can review and customize.\n"
+                        "{}",
+                        ui::dim("ℹ Using Termaxa's built-in starter policy (read-only).")
+                    );
+                    eprintln!(
+                        "{}\n",
+                        ui::dim(
+                            "ℹ Run `termaxa init` to create a policy you can review and customize."
+                        )
                     );
                     (Policy::builtin()?, paths::demo_state_dir()?)
                 }
@@ -166,30 +188,40 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let signals = context::gather(&cmd);
             let (decision, escalated) = context::apply(base, &signals);
 
-            println!("command : {}", cmd);
-            println!("decision: {}", decision.action);
+            println!();
+            println!("{}", ui::field("command", &cmd));
+            println!(
+                "{}",
+                ui::field("decision", &ui::decision(&decision.action.to_string()))
+            );
             if let Some(rule) = &decision.matched_rule {
-                println!("rule    : {}", rule);
+                println!("{}", ui::field("rule", &ui::dim(rule)));
             }
-            println!("reason  : {}", decision.reason);
+            println!("{}", ui::field("reason", &decision.reason));
             for s in &signals {
-                println!(
-                    "context : {}{}",
-                    s.label,
-                    if s.escalate { "  ⚠" } else { "" }
-                );
+                let line = if s.escalate {
+                    format!("{}  {}", s.label, ui::amber("⚠"))
+                } else {
+                    s.label.clone()
+                };
+                println!("{}", ui::field("context", &ui::dim(&line)));
             }
             if escalated {
-                println!("note    : context escalated allow → ask");
+                println!(
+                    "{}",
+                    ui::field("note", &ui::amber("context escalated allow → ask"))
+                );
             }
+
             let mut preview_summary = None;
             if let Some(pv) = preview::generate(&cmd) {
-                println!("\npreview : {}", pv.title);
+                println!("\n{}", ui::bold(&pv.title));
                 for l in &pv.lines {
                     println!("{}", l);
                 }
                 preview_summary = Some(pv.summary);
             }
+
             // Record the dry-run in the audit trail with source "check".
             let log = audit::AuditLog::new(&state_dir)?;
             let (ts_ms, ts) = audit::now();
@@ -253,15 +285,14 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 return Ok(0);
             }
             if entries.is_empty() {
-                println!("(audit log is empty)");
+                println!("{}", ui::dim("(audit log is empty)"));
                 return Ok(0);
             }
             for e in entries {
-                let mark = match e.decision.as_str() {
-                    "allow" => "✓",
-                    "ask" => "?",
-                    _ => "✗",
-                };
+                // Shared with the report: a post-execution receipt is a
+                // success, not a denial (the v0.12 fix), and the colour comes
+                // from one place so every surface agrees.
+                let mark = ui::mark(&e.decision, &e.source);
                 let outcome = match (e.approved, e.exit_code) {
                     (Some(true), Some(code)) => format!("  → approved, exit {}", code),
                     (Some(false), _) => "  → not run".to_string(),
@@ -275,13 +306,17 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     .unwrap_or_default();
                 println!(
                     "{} {} [{}{}] {} — {}{}{}",
-                    e.ts,
+                    ui::dim(&e.ts),
                     mark,
                     e.source,
                     sess,
                     e.command,
                     e.reason,
-                    if e.escalated { "  ⚠ escalated" } else { "" },
+                    if e.escalated {
+                        format!("  {}", ui::amber("⚠ escalated"))
+                    } else {
+                        String::new()
+                    },
                     outcome
                 );
             }
@@ -302,16 +337,25 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let log = audit::AuditLog::new(&p.state_dir)?;
             let entries = log.read_last(1_000_000)?;
             if entries.is_empty() {
-                println!("(audit log is empty)");
+                println!("{}", ui::dim("(audit log is empty)"));
                 return Ok(0);
             }
             let total = entries.len();
             let count =
                 |f: &dyn Fn(&audit::AuditEntry) -> bool| entries.iter().filter(|e| f(e)).count();
             println!("entries    : {}", total);
-            println!("  allow    : {}", count(&|e| e.decision == "allow"));
-            println!("  ask      : {}", count(&|e| e.decision == "ask"));
-            println!("  deny     : {}", count(&|e| e.decision == "deny"));
+            println!(
+                "  allow    : {}",
+                ui::green(&count(&|e| e.decision == "allow").to_string())
+            );
+            println!(
+                "  ask      : {}",
+                ui::amber(&count(&|e| e.decision == "ask").to_string())
+            );
+            println!(
+                "  deny     : {}",
+                ui::red(&count(&|e| e.decision == "deny").to_string())
+            );
             println!(
                 "by source  : hook {} / run {} / check {}",
                 count(&|e| e.source == "hook"),
@@ -344,13 +388,17 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let p = paths::resolve()?;
             let records = backup::list(&p.state_dir)?;
             if records.is_empty() {
-                println!("(no backups yet)");
+                println!("{}", ui::dim("(no backups yet)"));
                 return Ok(0);
             }
             for r in records {
                 println!(
                     "{}  {}  [{}]  {}\n    insures: {}",
-                    r.id, r.ts, r.kind, r.note, r.command
+                    r.id,
+                    ui::dim(&r.ts),
+                    r.kind,
+                    r.note,
+                    ui::dim(&r.command)
                 );
             }
             Ok(0)
@@ -394,7 +442,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 return Ok(1);
             }
             let msg = backup::restore(&p.state_dir, &id)?;
-            println!("✓ {}", msg);
+            println!("{} {}", ui::green("✓"), msg);
             Ok(0)
         }
     }
