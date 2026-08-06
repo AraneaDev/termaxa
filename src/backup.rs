@@ -280,14 +280,31 @@ fn backup_pg(
 // rm: copy targets aside before deletion
 // ---------------------------------------------------------------------------
 
+/// Paths a delete command would destroy, resolved to real filesystem paths.
+///
+/// Two bugs lived in the previous version, both surfaced when the v0.14 delete
+/// preview and this function disagreed about the same command:
+///
+///   1. It built paths with `PathBuf::from(token)`, so a Git Bash form like
+///      `/c/Users/x/Desktop` never passed `.exists()` on Windows and the
+///      command silently got NO insurance — while the identical target written
+///      `C:\Users\x\Desktop` was fully backed up. Path syntax must never
+///      decide whether a safety net exists.
+///   2. It matched only `rm`, so PowerShell and cmd deletes were uninsured
+///      even though the classifier and the policy both recognise them.
+///
+/// Everything here routes through `crate::delete` — the same resolution and
+/// the same per-shell flag rules the preview uses — so the two engines cannot
+/// disagree about what a command targets.
 fn rm_targets(tokens: &[String]) -> Option<Vec<PathBuf>> {
-    if tokens.first().map(|t| t.as_str()) != Some("rm") {
+    let head = crate::delete::command_head(tokens.first()?);
+    if !crate::delete::is_delete_command(&head) {
         return None;
     }
     let paths: Vec<PathBuf> = tokens[1..]
         .iter()
-        .filter(|t| !t.starts_with('-'))
-        .map(PathBuf::from)
+        .filter(|t| !crate::delete::is_flag(&head, t))
+        .map(|t| crate::delete::resolve_path(t))
         .filter(|p| p.exists())
         .collect();
     if paths.is_empty() {
@@ -459,5 +476,69 @@ fn git_out(args: &[&str]) -> Option<String> {
         None
     } else {
         Some(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real temp directory containing one file.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tmx-bk-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("f.txt"), "x").unwrap();
+        dir
+    }
+
+    #[test]
+    fn path_syntax_does_not_decide_whether_insurance_exists() {
+        // The v0.14 bug: `/c/Users/x/Desktop` got no backup while the
+        // identical target written `C:\Users\x\Desktop` did. The case where
+        // insurance mattered most was the one silently without it.
+        let dir = scratch("syntax");
+        let win = dir.display().to_string();
+        let planned_win = plan(&format!("rm -rf {}", win)).is_some();
+        assert!(planned_win, "an existing path must be insurable: {win}");
+
+        #[cfg(windows)]
+        {
+            // C:\Users\x\tmp  ->  /c/Users/x/tmp
+            let bash = format!("/{}", win.replacen(':', "", 1).replace('\\', "/"));
+            assert_eq!(
+                plan(&format!("rm -rf {}", bash)).is_some(),
+                planned_win,
+                "git-bash form must reach the same decision, got none for {bash}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn powershell_and_cmd_deletes_are_insurable_too() {
+        // Previously only `rm` was matched, so every PowerShell and cmd delete
+        // ran uninsured even though policy and the classifier both gate them.
+        let dir = scratch("shells");
+        let p = dir.display().to_string();
+
+        assert!(plan(&format!("Remove-Item -Recurse -Force {}", p)).is_some());
+        assert!(plan(&format!("del /s /q {}", p)).is_some());
+        assert!(plan(&format!("rmdir /s {}", p)).is_some());
+        assert!(plan(&format!("rm -rf {}", p)).is_some());
+
+        // Non-deletes stay uninsured.
+        assert!(plan("git status").is_none());
+        assert!(plan(&format!("ls -la {}", p)).is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cmd_switches_are_not_treated_as_targets() {
+        // `/s` must not be resolved as a path, and a nonexistent target must
+        // not produce a plan merely because a switch was present.
+        assert!(plan("del /s /q C:\\definitely-not-here-xyz-9f2").is_none());
     }
 }

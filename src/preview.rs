@@ -16,7 +16,20 @@ pub struct Preview {
     pub summary: String,
 }
 
-pub fn generate(command: &str) -> Option<Preview> {
+/// Generate a preview, optionally with knowledge of the project root.
+///
+/// The root lets the delete preview answer "is this target outside the
+/// project?" — its single most useful signal, and one the process cwd cannot
+/// supply: in hook mode the agent may spawn us from anywhere (see the Cursor
+/// cwd bug). Callers that know the root pass it; callers that don't pass None
+/// and the signal is omitted rather than guessed.
+pub fn generate(command: &str, root: Option<&std::path::Path>) -> Option<Preview> {
+    // Deletes are checked across the whole command first: a compound like
+    // `mkdir x && rm -rf /` must not have its delete masked by an earlier
+    // segment producing a preview.
+    if let Some(p) = crate::delete::preview_for(command, root) {
+        return Some(p);
+    }
     // Compound commands: preview the first segment that has one.
     let segments = crate::shell::split_segments(command);
     if segments.len() > 1 {

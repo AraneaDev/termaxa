@@ -53,7 +53,8 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
         }
     };
 
-    let preview_summary = crate::preview::generate(&command).map(|p| p.summary);
+    let root = paths.project_dir.parent();
+    let preview_summary = crate::preview::generate(&command, root).map(|p| p.summary);
 
     let (approved, exit_code) = match decision.action {
         Action::Deny => {
@@ -61,7 +62,7 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
             (Some(false), None)
         }
         Action::Ask => {
-            if let Some(pv) = crate::preview::generate(&command) {
+            if let Some(pv) = crate::preview::generate(&command, root) {
                 println!("┌ {}", pv.title);
                 for l in &pv.lines {
                     println!("│{}", l);

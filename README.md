@@ -112,6 +112,47 @@ $ termaxa rollback b-1783006590625
 
 Force push measures what the remote will *lose*, not just gain — and pins it to a backup branch first.
 
+### 5 - What a delete actually costs
+
+Deletes are the most common destructive command and the easiest to get wrong,
+because a path can look correctly scoped right up until it isn't:
+
+```console
+$ termaxa check "rm -rf /c/Users/harih"
+decision  ask
+reason    no rule matched; policy default is `ask`
+
+delete impact
+  target      : C:\Users\harih
+  as written  : /c/Users/harih
+  ⚠ OUTSIDE the project root (C:\Users\harih\project)
+  ⚠ resolves to a USER PROFILE directory
+  ⚠ contains  : .ssh (SSH private keys), .aws (AWS credentials)
+  contains    : 5,000+ files (stopped counting) across 422 directories
+  ✗ insurance : too large to copy (5,000+ files) — NOT recoverable
+```
+
+`/c/Users/harih` is Git Bash syntax for `C:\Users\harih` — a real user
+profile, not a stray directory. Termaxa resolves the path, counts what's
+actually inside it (budgeted: 5,000 files or 300ms, and it says when it
+stopped counting), flags credentials in the blast radius, and tells you
+whether a backup is even possible.
+
+An ordinary in-project delete says none of that, which is the point — a
+warning that fires on `rm -rf ./target` is a warning nobody reads:
+
+```console
+$ termaxa check "rm -rf ./target"
+delete impact
+  target      : /home/you/project/target
+  contains    : 1,204 files across 38 directories
+  insurance   : copy 1 path(s) to .termaxa/backups before deletion
+```
+
+**What it can't do:** know what you meant. If the path has a typo in it,
+Termaxa will faithfully report the blast radius of the path you actually
+typed. Making that gap visible before execution is the whole contribution.
+
 ### Is it actually wired up?
 
 The failure mode nobody warns you about: the hook is installed, the agent doesn't call it, and everything looks fine. `termaxa doctor` answers the question directly.
@@ -304,7 +345,13 @@ Termaxa is pre-1.0. It's real and tested, and it is not magic. Specifically:
 - **Hooks advise; they don't enforce.** Termaxa gates commands an agent submits through the Claude Code or Cursor hook. Those agents are *cooperative* — they respect a `deny` and propose an alternative, which is what makes the gate work. An agent running in full-auto mode could, in principle, retry a blocked action through a different command or shell; the circuit breaker raises the cost of that, but a hook is an *integration* point for visibility and policy, not an *enforcement* boundary. True enforcement means owning the execution path — that's **Termaxa Runtime**, on the roadmap. For hard guarantees today, pair Termaxa with OS-level sandboxing.
 - **Native agent tools bypass the gate.** The hook sees *shell* commands. An agent's own built-in file/edit tools don't go through the shell — observed in live testing, a Cursor agent switched to its native file-delete tool and removed files Termaxa never saw. Non-shell tool calls need OS-level isolation underneath.
 - **Cooperative, not a sandbox.** Termaxa governs commands that flow through the agent hook or `termaxa run`. An agent with raw, unhooked shell access is *not* contained — that needs OS-level sandboxing, a complementary layer. The threat model is *agents making expensive mistakes*, not a malicious agent actively evading you.
-- **Shell parsing is good, not perfect.** It splits on `&&`, `||`, `;`, `|` and flags `$(...)`. Subshells `( )`, deeply nested quoting, and variable-expanded commands are judged conservatively, not deeply understood. In particular, a path built from a variable (`rm -rf ~/x/$SID`) is evaluated as written — if the variable expands to empty at runtime, the real blast radius is wider than the command string suggests.
+- **Shell parsing is good, not perfect.** It splits on `&&`, `||`, `;`, `|`
+  and flags `$(...)`. Subshells `( )`, deeply nested quoting, and
+  variable-expanded commands are judged conservatively, not deeply
+  understood. A path built from a variable (`rm -rf ~/x/$SID`) is evaluated
+  as written: the delete preview will report the blast radius of
+  `~/x/$SID` literally, and if the variable expands to empty at runtime the
+  real target is the parent. Termaxa cannot see the caller's environment.
 - **Previews are best-effort.** No database connection → static analysis only. Terraform previews shell out to `terraform plan`. Remote Terraform state is versioned by its backend, not by Termaxa.
 - **Backups have edges.** `rm` insurance keys on the literal `rm` command. Postgres backups use `pg_dump`/`psql` and must be on your PATH. No retention/pruning yet — backups accumulate.
 - **The format may still change.** Pre-1.0 means the policy schema and CLI can shift between minor versions. Pin a release.

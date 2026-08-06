@@ -1,6 +1,7 @@
 mod audit;
 mod backup;
 mod context;
+mod delete;
 mod doctor;
 mod hook;
 mod init;
@@ -214,7 +215,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
 
             let mut preview_summary = None;
-            if let Some(pv) = preview::generate(&cmd) {
+            let root = resolved.as_ref().and_then(|p| p.project_dir.parent());
+            if let Some(pv) = preview::generate(&cmd, root) {
                 println!("\n{}", ui::bold(&pv.title));
                 for l in &pv.lines {
                     println!("{}", l);

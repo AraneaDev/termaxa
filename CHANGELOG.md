@@ -2,6 +2,59 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.14.0 — what a delete actually costs
+
+Every other preview engine answers "what will this destroy?" with a real
+number — commits lost, rows affected, resources destroyed. Deletes were the
+gap: the most common destructive command produced no preview at all. This
+release closes it, and in doing so uncovered two insurance bugs that had been
+live for three versions.
+
+### Added
+- **Delete blast radius.** `rm`, `Remove-Item`, `del`, `rmdir`, `rd` and
+  `unlink` now produce an impact preview before the decision:
+  - the **resolved** target, including Git Bash (`/c/...`), WSL
+    (`/mnt/c/...`), `~` and relative forms
+  - whether it falls **outside the project root**, resolves to a **user
+    profile**, or is a **filesystem root**
+  - **sensitive children** one level deep — `.ssh`, `.aws`, `.gnupg`, `.env`,
+    `.kube`, `id_rsa`, `.npmrc` and similar
+  - a **recursive file count**, budgeted at 5,000 files or 300ms, whichever
+    comes first. A capped count says it was capped: "5,000+" is never
+    reported as "5,000".
+  - whether the operation is **insurable**, and if not, which of the two
+    reasons applies
+
+  The preview flows into the agent's own confirmation prompt, so the person
+  approving sees the consequence rather than just the command string.
+
+### Fixed
+- **Path syntax decided whether a backup existed.**
+  `rm -rf C:\Users\x\Desktop` was fully insured;
+  `rm -rf /c/Users/x/Desktop` — the identical target — silently got no
+  backup at all, because the backup planner built paths from the raw token
+  and the Git Bash form failed an existence check on Windows. Agents on
+  Windows emit that form routinely, so this was the case where insurance
+  mattered most and quietly wasn't there.
+- **PowerShell and cmd deletes were never insured.** The backup planner
+  matched only `rm`, so `Remove-Item`, `del`, `rmdir` and `rd` ran without a
+  backup even though the classifier and policy had gated them since v0.11.
+- The delete preview and the backup planner now share one implementation of
+  target extraction, path resolution and flag parsing, so the two engines
+  cannot disagree about what a command targets.
+
+### Notes
+- Insurance messages now name which fact is true — "too large to copy
+  (5,000+ files)" versus "no backup covers this command". They are different
+  situations and the ambiguous phrasing was hiding the bug above.
+- Flag syntax is resolved per shell rather than by string shape: `/s` is a
+  cmd switch and `/c` is a drive root, and a shape-based guess drops
+  `rm -rf /c` — a whole-drive delete.
+- **What this does NOT do:** it cannot know what you *meant*. Nothing here
+  would have detected that a path contained a typo. It reports what the path
+  contains; the gap between intent and contents is the thing being made
+  visible.
+  
 ## v0.13.0 — the first sixty seconds
 
 Activation release: what a developer sees between `cargo install` and their
@@ -44,7 +97,7 @@ first intercepted command.
 - On Windows PowerShell 5.1, `>` redirection writes UTF-16 and mangles
   Unicode glyphs. That's the shell, not Termaxa — use PowerShell 7, or
   `termaxa report --md | Out-File -Encoding utf8 report.md`.
-  
+
 ## v0.12.0 — the flight recorder
 
 `termaxa report` becomes the answer to "what actually happened while my agent
