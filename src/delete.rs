@@ -224,17 +224,30 @@ pub fn is_flag(head: &str, token: &str) -> bool {
         "rm" | "unlink" => token.starts_with('-'),
         // PowerShell: -Recurse, -Force, -Path. Never `/`.
         "remove-item" | "ri" => token.starts_with('-'),
-        // cmd-only: /s /q /f are switches, and cmd has no unix-path forms,
-        // so a leading slash is unambiguous here.
-        "del" | "rd" => token.starts_with('/') || token.starts_with('-'),
-        // `rmdir` exists in BOTH shells, so neither rule is safe alone.
-        // Disambiguate as narrowly as possible: a bare two-character switch
-        // (`/s`, `/q`) is a flag, anything longer is a path. Unlike `rm`,
-        // POSIX rmdir cannot recurse and only removes empty directories, so
-        // a lone `/c` here is not the catastrophic case it is for `rm`.
-        "rmdir" => token.starts_with('-') || (token.len() == 2 && token.starts_with('/')),
+        // cmd-family: /s /q /f are switches. But "a leading slash means a
+        // switch" is too broad — on Unix every absolute path starts with one,
+        // and `rmdir` exists in both shells. Found by CI: `del /s /q /tmp/x`
+        // ate its own target on Linux and macOS.
+        //
+        // So match the SHAPE of a cmd switch, not merely the slash: a bare
+        // two-character token (`/s`, `/q`) or an attribute selector
+        // (`/a:h`). Anything longer is a path.
+        "del" | "rd" | "rmdir" => token.starts_with('-') || is_cmd_switch(token),
         _ => token.starts_with('-'),
     }
+}
+
+/// A cmd.exe switch: `/s`, `/q`, `/f`, or an attribute selector like `/a:h`.
+///
+/// Deliberately shape-matched rather than "starts with a slash": on Unix an
+/// absolute path also starts with a slash, and `rmdir` is a real command on
+/// both platforms. The narrow rule keeps `/tmp/build` and `/c/Users/x` as
+/// targets while still filtering the switches cmd actually uses.
+fn is_cmd_switch(token: &str) -> bool {
+    if !token.starts_with('/') {
+        return false;
+    }
+    token.len() == 2 || (token.len() <= 4 && token.starts_with("/a:"))
 }
 
 /// Normalise a command head to a bare, lowercase program name:
@@ -606,6 +619,14 @@ mod tests {
         assert!(is_flag("rmdir", "-p"));
         assert!(!is_flag("rmdir", "/c/data"));
         assert!(!is_flag("rmdir", "./build"));
+
+        // Caught by CI on Linux/macOS: "a leading slash is a switch" ate the
+        // target of `del /s /q /tmp/x`, because every absolute Unix path
+        // starts with a slash.
+        assert!(!is_flag("del", "/tmp/x"));
+        assert!(!is_flag("rd", "/var/lib/thing"));
+        assert!(is_flag("del", "/a:h"));
+        assert!(!is_flag("del", "/a/b/c"));
     }
 
     #[test]
