@@ -240,8 +240,13 @@ fn backup_pg(
     let dir = backups_dir(termaxa_dir)?;
     let file = dir.join(format!("{}-pg.sql", id));
 
-    // Reuse the psql connection args verbatim; swap the binary for pg_dump.
-    let mut args: Vec<String> = crate::pg::strip_command_flag(tokens)[1..].to_vec();
+    // Take ONLY the connection parameters, rebuilt (see pg::connection_args).
+    // Copying the psql argv verbatim used to void insurance silently: psql's
+    // `-t` is pg_dump's `--table`, and `-X`/`-A`/`-1` are not pg_dump options,
+    // so pg_dump exited non-zero, `take` returned Err, and `hook` ignores Err.
+    // `psql -X -d shop -c "TRUNCATE users"` got no backup while the same
+    // command without `-X` did.
+    let mut args: Vec<String> = crate::pg::connection_args(tokens);
     for t in tables {
         args.push("-t".into());
         args.push(t.clone());
@@ -265,7 +270,7 @@ fn backup_pg(
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let conn: Vec<String> = crate::pg::strip_command_flag(tokens);
+    let conn: Vec<String> = crate::pg::connection_args(tokens);
     Ok(BackupRecord {
         id: id.into(),
         ts: ts.into(),
@@ -425,20 +430,21 @@ pub fn restore(termaxa_dir: &Path, id: &str) -> Result<String> {
         }
         "pg-dump" => {
             let file = record.data["file"].as_str().context("bad record")?;
-            let conn: Vec<String> = record.data["conn"]
-                .as_array()
-                .context("bad record")?
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            let mut args: Vec<String> = conn[1..].to_vec();
+            // Derive the connection from the ORIGINAL command every time,
+            // through the same allowlist used to take the backup. Two reasons:
+            // the stored `conn` of a pre-0.14.1 record is the user's raw argv,
+            // which would carry `-f`/`-o` into this psql call; and indexing
+            // conn[0]/conn[1..] panicked on an empty array.
+            let tokens = crate::pg::shell_tokens(&record.command);
+            let prog = crate::pg::psql_program(&tokens).unwrap_or_else(|| "psql".to_string());
+            let mut args: Vec<String> = crate::pg::connection_args(&tokens);
             args.extend(
-                ["-v", "ON_ERROR_STOP=1", "-f"]
+                ["-w", "-X", "-v", "ON_ERROR_STOP=1", "-f"]
                     .iter()
                     .map(|s| s.to_string()),
             );
             args.push(file.to_string());
-            let out = Command::new(&conn[0]).args(&args).output()?;
+            let out = Command::new(&prog).args(&args).output()?;
             if !out.status.success() {
                 bail!(
                     "psql restore failed: {}",

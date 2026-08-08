@@ -6,49 +6,21 @@ use std::process::Command;
 
 pub const STARTER_POLICY: &str = r#"# Termaxa policy — first matching rule wins; `*` is a wildcard.
 # Actions: allow (run silently) | ask (require approval) | deny (block)
+#
+# ORDER MATTERS, and the hard stops come first on purpose. Until v0.14.1 the
+# read-only allows sat at the top, so a broad prefix shadowed the stop below
+# it: `git branch -D main` matched `git branch*` and was ALLOWED, and
+# `echo $(rm -rf /)` matched `echo *` before `*rm -rf*` could deny it. A rule
+# that can never be reached is not a rule. Put your own exceptions ABOVE the
+# deny you want them to override — that is what first-match-wins is for.
+#
+# Matching is case-insensitive, so a rule cannot distinguish `-D` from `-d`.
+# Where a flag's case carries the meaning (git branch -D, rm -R), the rule
+# covers both and the action is chosen for the safer of the two.
 version: 1
 default: ask
 
 rules:
-  # ---- read-only operations: let the agent work ----
-  - match: "git status*"
-    action: allow
-  - match: "git diff*"
-    action: allow
-  - match: "git log*"
-    action: allow
-  - match: "git branch*"
-    action: allow
-  - match: "ls*"
-    action: allow
-  - match: "cat *"
-    action: allow
-  - match: "grep*"
-    action: allow
-  - match: "echo *"
-    action: allow
-  - match: "git remote -v"
-    action: allow
-  - match: "git fetch*"
-    action: allow
-  - match: "terraform plan*"
-    action: allow
-  - match: "terraform init*"
-    action: allow
-  - match: "tofu plan*"
-    action: allow
-  - match: "tofu apply*"
-    action: ask
-  - match: "tofu destroy*"
-    action: deny
-    reason: "tofu destroy is blocked by policy."
-  - match: "kubectl get*"
-    action: allow
-  - match: "kubectl describe*"
-    action: allow
-  - match: "docker ps*"
-    action: allow
-
   # ---- destructive: hard stops ----
   - match: "git push*--force*"
     action: deny
@@ -92,17 +64,26 @@ rules:
   - match: "*drop database*"
     action: deny
     reason: "DROP DATABASE is blocked."
-
-  # ---- consequential: human in the loop ----
-  - match: "git push*"
-    action: ask
-  - match: "git commit*"
-    action: allow
-  - match: "terraform apply*"
-    action: ask
   - match: "terraform destroy*"
     action: deny
     reason: "terraform destroy is blocked by policy."
+  - match: "tofu destroy*"
+    action: deny
+    reason: "tofu destroy is blocked by policy."
+
+  # ---- consequential: human in the loop ----
+  # `git branch -D` force-deletes an unmerged branch. Case-insensitive
+  # matching cannot separate it from the safe `-d`, so this asks rather than
+  # denies; the commits remain in the reflog either way.
+  - match: "git branch*-d*"
+    action: ask
+    reason: "Deleting a branch. `-D` force-deletes even if unmerged."
+  - match: "git push*"
+    action: ask
+  - match: "terraform apply*"
+    action: ask
+  - match: "tofu apply*"
+    action: ask
   - match: "docker rm*"
     action: ask
   - match: "docker system prune*"
@@ -119,6 +100,42 @@ rules:
     action: ask
   - match: "ssh *"
     action: ask
+
+  # ---- read-only operations: let the agent work ----
+  - match: "git status*"
+    action: allow
+  - match: "git diff*"
+    action: allow
+  - match: "git log*"
+    action: allow
+  - match: "git branch*"
+    action: allow
+  - match: "git commit*"
+    action: allow
+  - match: "ls*"
+    action: allow
+  - match: "cat *"
+    action: allow
+  - match: "grep*"
+    action: allow
+  - match: "echo *"
+    action: allow
+  - match: "git remote -v"
+    action: allow
+  - match: "git fetch*"
+    action: allow
+  - match: "terraform plan*"
+    action: allow
+  - match: "terraform init*"
+    action: allow
+  - match: "tofu plan*"
+    action: allow
+  - match: "kubectl get*"
+    action: allow
+  - match: "kubectl describe*"
+    action: allow
+  - match: "docker ps*"
+    action: allow
 
 # Session circuit breaker (v0.11): if the same destructive intent
 # (file delete / db destroy / git force / infra destroy) is asked or
@@ -360,4 +377,66 @@ pub(crate) fn which(bin: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `examples/policy.yaml` is the file people copy. It had drifted to 28
+    /// rules against the starter's 44 — missing every broad delete deny and
+    /// the whole circuit_breaker block — with nothing to signal it was weaker.
+    /// It is now generated from STARTER_POLICY, and this test is what keeps it
+    /// generated: an example policy that is quietly less safe than the real
+    /// one is worse than no example at all.
+    #[test]
+    fn shipped_example_policy_matches_the_starter_policy() {
+        // Normalise line endings before comparing. Git checks this file out
+        // with CRLF on Windows (core.autocrlf) while STARTER_POLICY is a Rust
+        // literal with LF, so a byte comparison fails on Windows only. What
+        // this test is for is content drift, not line endings.
+        let example = include_str!("../examples/policy.yaml").replace("\r\n", "\n");
+        assert_eq!(
+            example, STARTER_POLICY,
+            "examples/policy.yaml has drifted from init::STARTER_POLICY. \
+             Regenerate it rather than editing it by hand."
+        );
+    }
+
+    /// Schipper review, finding 3: order is load-bearing, so assert the shape
+    /// rather than trusting a comment to hold.
+    #[test]
+    fn hard_stops_are_reachable_before_the_read_only_allows() {
+        let p: crate::policy::Policy = serde_yaml::from_str(STARTER_POLICY).unwrap();
+        let first_allow = p
+            .rules
+            .iter()
+            .position(|r| r.action == crate::policy::Action::Allow)
+            .expect("starter policy has allow rules");
+        let last_deny = p
+            .rules
+            .iter()
+            .rposition(|r| r.action == crate::policy::Action::Deny)
+            .expect("starter policy has deny rules");
+        assert!(
+            last_deny < first_allow,
+            "a deny rule sits below an allow prefix and can never be reached"
+        );
+    }
+
+    #[test]
+    fn the_shadowed_commands_are_no_longer_allowed() {
+        let p: crate::policy::Policy = serde_yaml::from_str(STARTER_POLICY).unwrap();
+        for cmd in [
+            "git branch -D main",
+            "echo $(rm -rf /)",
+            "git status & rm -rf /",
+        ] {
+            assert_ne!(
+                p.evaluate_command(cmd).action,
+                crate::policy::Action::Allow,
+                "{cmd} is still allowed"
+            );
+        }
+    }
 }

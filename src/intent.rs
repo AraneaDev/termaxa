@@ -20,10 +20,10 @@
 //!   unanswered/unconfirmed asks count. Until post-execution hooks are wired
 //!   for a given agent, this degrades to strict counting (all asks count).
 //!
-//! This module is deliberately self-contained: it has its own light
-//! tokenizer and segment splitter so it compiles without changing the
-//! visibility of anything in `backup.rs`, `pg.rs`, or `shell.rs`. If you
-//! later make `shell::split_segments` pub, you can swap the private copy out.
+//! This module keeps its own light tokenizer, but segment splitting is
+//! shared with the policy engine (`shell::split_segments`) on purpose: when
+//! the two had separate copies they disagreed, and a classifier that reads a
+//! command differently from the gate is worse than no classifier.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -86,7 +86,7 @@ impl Intent {
 /// segment, and returns the most severe intent found — mirroring the
 /// "most dangerous segment dictates the verdict" rule.
 pub fn classify_command(command: &str) -> Option<Intent> {
-    split_segments(command)
+    crate::shell::split_segments(command)
         .iter()
         .filter_map(|seg| classify_segment(seg))
         .max_by_key(|i| i.rank())
@@ -386,48 +386,16 @@ fn tokens(segment: &str) -> Vec<String> {
     out
 }
 
-fn split_segments(command: &str) -> Vec<String> {
-    let mut segs = Vec::new();
-    let mut cur = String::new();
-    let mut quote: Option<char> = None;
-    let mut chars = command.chars().peekable();
-    while let Some(c) = chars.next() {
-        match quote {
-            Some(q) => {
-                cur.push(c);
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                '"' | '\'' => {
-                    quote = Some(c);
-                    cur.push(c);
-                }
-                '&' | '|' => {
-                    if chars.peek() == Some(&c) {
-                        chars.next();
-                    }
-                    if !cur.trim().is_empty() {
-                        segs.push(cur.trim().to_string());
-                    }
-                    cur.clear();
-                }
-                ';' => {
-                    if !cur.trim().is_empty() {
-                        segs.push(cur.trim().to_string());
-                    }
-                    cur.clear();
-                }
-                _ => cur.push(c),
-            },
-        }
-    }
-    if !cur.trim().is_empty() {
-        segs.push(cur.trim().to_string());
-    }
-    segs
-}
+// Segment splitting is delegated to `shell::split_segments` — the SAME
+// function the policy engine uses.
+//
+// This module used to carry its own copy, and the copies disagreed. The local
+// one split on a lone `&` but not on newlines; `shell`'s did the reverse. So
+// `git status & rm -rf /` classified correctly and was allowed anyway, while
+// `"git status\nrm -rf /"` was denied by policy but invisible to the breaker's
+// counter. Two parsers for one grammar is the failure `delete::command_head`
+// was introduced to end; this is the same fix applied to the same shape of
+// bug.
 
 // ---------------------------------------------------------------------------
 // Tests

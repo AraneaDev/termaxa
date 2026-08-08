@@ -187,22 +187,39 @@ impl TableInfo {
     }
 }
 
-/// Take the original psql command, strip its `-c <sql>`, and append our own
-/// read-only catalog query — inheriting host/port/user/db/password env verbatim.
+/// Take the original psql command, extract ONLY its connection parameters, and
+/// run our own read-only catalog query against them.
+///
+/// SECURITY (v0.14.1). This function used to copy the user's argv wholesale and
+/// merely strip `-c`. That passed every other flag through to a psql we
+/// ourselves executed — and psql honours `-f` and `-c` in the same invocation.
+/// So `psql -d shop -f wipe.sql -c "DROP TABLE users"` made the *preview* run
+/// wipe.sql. `hook::run` generates the preview before returning a decision, so
+/// it happened on commands Termaxa then denied: the gate performed the damage
+/// it had just blocked. Reproduced end-to-end against a live database.
+///
+/// The fix is not "also strip -f". A denylist is a losing game — `-o` truncates
+/// an arbitrary file, `-L` writes one, `-W` blocks on a prompt, and psql may add
+/// more. We now REBUILD the argv from a small allowlist of connection
+/// parameters, so nothing we did not explicitly recognise can reach the child
+/// process. `-w` is forced so the preview can never hang waiting for a password.
 fn introspect(original_command: &str, table: &str) -> Option<TableInfo> {
     let esc = table.replace('\'', "''"); // embed safely inside '...'
     let q = format!(
-        "SELECT COALESCE((SELECT reltuples::bigint FROM pg_class WHERE oid = '{esc}'::regclass), -1); \
+        "SET default_transaction_read_only = on; \
+         SELECT COALESCE((SELECT reltuples::bigint FROM pg_class WHERE oid = '{esc}'::regclass), -1); \
          SELECT COALESCE(string_agg(DISTINCT c.conrelid::regclass::text, ','), '') \
            FROM pg_constraint c WHERE c.contype = 'f' AND c.confrelid = '{esc}'::regclass;"
     );
 
-    let mut args = strip_command_flag(&shell_tokens(original_command));
-    args.extend(["-t", "-A", "-X", "-c"].iter().map(|s| s.to_string()));
+    let tokens = shell_tokens(original_command);
+    let prog = psql_program(&tokens)?;
+    let mut args = connection_args(&tokens);
+    args.extend(["-w", "-t", "-A", "-X", "-c"].iter().map(|s| s.to_string()));
     args.push(q);
 
-    let out = Command::new(&args[0])
-        .args(&args[1..])
+    let out = Command::new(&prog)
+        .args(&args)
         .env("PGCONNECT_TIMEOUT", "3")
         .output()
         .ok()?;
@@ -210,7 +227,14 @@ fn introspect(original_command: &str, table: &str) -> Option<TableInfo> {
         return None; // wrong table, no permissions, db down — degrade to static
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    // psql echoes a command-status tag for the leading SET even under -t -A,
+    // so it arrives as a line before the two result rows. Drop it explicitly
+    // rather than positionally — a silent parse failure here degrades the
+    // preview to "database unreachable", which reads like a connection problem.
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && *l != "SET");
     let rows: i64 = lines.next()?.trim().parse().ok()?;
     let dependents: Vec<String> = lines
         .next()
@@ -225,24 +249,149 @@ fn introspect(original_command: &str, table: &str) -> Option<TableInfo> {
     Some(TableInfo { rows, dependents })
 }
 
-/// Remove `-c/--command <arg>` pairs, keeping every other argument untouched.
-pub fn strip_command_flag(tokens: &[String]) -> Vec<String> {
+/// The psql binary to invoke, taken from the command's own first token so a
+/// non-PATH install (`/usr/local/pgsql/bin/psql`) still works. The file name
+/// must be exactly `psql`; `ends_with("psql")` would also accept `evilpsql`.
+pub fn psql_program(tokens: &[String]) -> Option<String> {
+    let first = tokens.first()?;
+    let name = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    let stem = name.strip_suffix(".exe").unwrap_or(name);
+    if stem == "psql" {
+        Some(first.clone())
+    } else {
+        None
+    }
+}
+
+/// psql short options that consume a value, so a dropped flag also drops its
+/// argument instead of leaving it to be mistaken for the positional dbname.
+const PSQL_VALUE_SHORT: &[char] = &[
+    'c', 'd', 'f', 'v', 'L', 'o', 'F', 'P', 'R', 'T', 'h', 'p', 'U',
+];
+
+/// psql long options that consume a value.
+const PSQL_VALUE_LONG: &[&str] = &[
+    "command",
+    "dbname",
+    "file",
+    "set",
+    "variable",
+    "log-file",
+    "output",
+    "field-separator",
+    "pset",
+    "record-separator",
+    "table-attr",
+    "host",
+    "port",
+    "username",
+];
+
+/// Extract ONLY the connection parameters from a psql command, rebuilt into a
+/// canonical form. This is an allowlist, and deliberately so.
+///
+/// Termaxa executes two children derived from a user's psql command: the
+/// preview's catalog query, and `pg_dump` for insurance. Copying the user's
+/// argv into either is unsafe in both directions:
+///
+///   - Into psql, `-f` executes a SQL file, `-o`/`-L` truncate arbitrary files,
+///     and `-W` blocks on a password prompt.
+///   - Into pg_dump, the flag namespaces disagree: psql's `-t` (tuples-only)
+///     is pg_dump's `--table`, and `-X`, `-A`, `-1` are not pg_dump options at
+///     all — so pg_dump exits non-zero and the backup is silently never taken.
+///     A harmless `-X` on the command line decided whether insurance existed.
+///
+/// Only `-h/-p/-U/-d` and a positional dbname survive, re-emitted as separate
+/// tokens. Everything else — including anything psql adds in future — is
+/// dropped, which fails toward "no live introspection", never toward
+/// "unexpected execution".
+pub fn connection_args(tokens: &[String]) -> Vec<String> {
+    let mut host: Option<String> = None;
+    let mut port: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut dbname: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
+
+    let mut i = 1; // token 0 is the program
+    while i < tokens.len() {
+        let t = &tokens[i];
+
+        // ---- long options -------------------------------------------------
+        if let Some(body) = t.strip_prefix("--") {
+            let (name, inline) = match body.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (body, None),
+            };
+            let takes_value = PSQL_VALUE_LONG.contains(&name);
+            let value = match (inline, takes_value) {
+                (Some(v), _) => Some(v),
+                (None, true) => {
+                    i += 1;
+                    tokens.get(i).cloned()
+                }
+                (None, false) => None,
+            };
+            match name {
+                "host" => host = value,
+                "port" => port = value,
+                "username" => user = value,
+                "dbname" => dbname = value,
+                _ => {} // dropped, value consumed above if it took one
+            }
+            i += 1;
+            continue;
+        }
+
+        // ---- short option clusters (`-tAX`, `-dshop`, `-U app`) ------------
+        if t.starts_with('-') && t.len() > 1 {
+            let chars: Vec<char> = t.chars().skip(1).collect();
+            let mut j = 0;
+            while j < chars.len() {
+                let f = chars[j];
+                if PSQL_VALUE_SHORT.contains(&f) {
+                    // rest of this token is the value; else the next token is
+                    let rest: String = chars[j + 1..].iter().collect();
+                    let value = if rest.is_empty() {
+                        i += 1;
+                        tokens.get(i).cloned()
+                    } else {
+                        Some(rest)
+                    };
+                    match f {
+                        'h' => host = value,
+                        'p' => port = value,
+                        'U' => user = value,
+                        'd' => dbname = value,
+                        _ => {} // -c, -f, -o, -L, -v, -F, -P, -R, -T: dropped
+                    }
+                    break; // value-taking flag ends the cluster
+                }
+                j += 1; // boolean flag (-t, -A, -X, -q, -1, -w, -W): dropped
+            }
+            i += 1;
+            continue;
+        }
+
+        positionals.push(t.clone());
+        i += 1;
+    }
+
+    // psql takes dbname then username as positionals, after the flags.
+    if dbname.is_none() {
+        dbname = positionals.first().cloned();
+    }
+    if user.is_none() {
+        user = positionals.get(1).cloned();
+    }
+
     let mut out = Vec::new();
-    let mut skip_next = false;
-    for t in tokens {
-        if skip_next {
-            skip_next = false;
-            continue;
+    for (flag, value) in [("-h", host), ("-p", port), ("-U", user), ("-d", dbname)] {
+        if let Some(v) = value {
+            if !v.is_empty() {
+                out.push(flag.to_string());
+                out.push(v);
+            }
         }
-        if t == "-c" || t == "--command" {
-            skip_next = true;
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix("--command=") {
-            let _ = rest;
-            continue;
-        }
-        out.push(t.clone());
     }
     out
 }
@@ -495,12 +644,73 @@ mod tests {
     }
 
     #[test]
-    fn strip_command_flag_keeps_connection_args() {
+    fn connection_args_keeps_only_connection_parameters() {
         let t = shell_tokens("psql -h db.prod -U app -d shop -c 'DROP TABLE x'");
-        let stripped = strip_command_flag(&t);
         assert_eq!(
-            stripped,
-            vec!["psql", "-h", "db.prod", "-U", "app", "-d", "shop"]
+            connection_args(&t),
+            vec!["-h", "db.prod", "-U", "app", "-d", "shop"]
         );
+    }
+
+    /// Schipper review, finding 10, confirmed against a live database: psql
+    /// honours `-f` and `-c` in one invocation, so passing `-f` through to the
+    /// preview's own psql call executed the user's SQL file — including on
+    /// commands Termaxa then denied.
+    #[test]
+    fn file_flag_never_reaches_the_preview_invocation() {
+        let t = shell_tokens(r#"psql -d shop -f wipe.sql -c "DROP TABLE users""#);
+        assert_eq!(connection_args(&t), vec!["-d", "shop"]);
+    }
+
+    /// The same class, one step further out: a denylist would have to grow
+    /// forever. `-o` truncates a file, `-L` writes one, `-W` blocks on a
+    /// prompt. None of them are connection parameters, so none survive.
+    #[test]
+    fn side_effecting_flags_are_dropped_not_enumerated() {
+        let t = shell_tokens(
+            r#"psql -d shop -o /etc/passwd -L audit.log -W -f a.sql -c "TRUNCATE users""#,
+        );
+        assert_eq!(connection_args(&t), vec!["-d", "shop"]);
+    }
+
+    /// The attached short form is one token, so an equality check on `-c`
+    /// missed it and the destructive SQL itself was re-executed.
+    #[test]
+    fn attached_short_forms_are_parsed_not_matched() {
+        let t = shell_tokens(r#"psql -dshop "-cTRUNCATE users""#);
+        assert_eq!(connection_args(&t), vec!["-d", "shop"]);
+    }
+
+    /// A cluster of booleans ending in a value-taking flag, getopt style.
+    #[test]
+    fn boolean_clusters_are_dropped_without_eating_the_dbname() {
+        let t = shell_tokens("psql -tAX -d shop -c 'TRUNCATE users'");
+        assert_eq!(connection_args(&t), vec!["-d", "shop"]);
+    }
+
+    /// A dropped flag must consume its own value, or `wipe.sql` would be left
+    /// looking like the positional dbname.
+    #[test]
+    fn dropped_flags_consume_their_value() {
+        let t = shell_tokens("psql -f wipe.sql shop app -c 'TRUNCATE users'");
+        assert_eq!(connection_args(&t), vec!["-U", "app", "-d", "shop"]);
+    }
+
+    #[test]
+    fn long_forms_both_spellings() {
+        let t = shell_tokens("psql --host=db --port 6543 --username=app --dbname shop -c 'x'");
+        assert_eq!(
+            connection_args(&t),
+            vec!["-h", "db", "-p", "6543", "-U", "app", "-d", "shop"]
+        );
+    }
+
+    #[test]
+    fn psql_program_requires_the_exact_binary_name() {
+        assert_eq!(
+            psql_program(&shell_tokens("/usr/local/pgsql/bin/psql -c 'x'")),
+            Some("/usr/local/pgsql/bin/psql".to_string())
+        );
+        assert_eq!(psql_program(&shell_tokens("evilpsql -c 'x'")), None);
     }
 }

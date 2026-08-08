@@ -230,7 +230,7 @@ struct Rollup {
     deny: usize,
     backups: usize,
     breaker_trips: usize,
-    top_projects: Vec<String>,
+    top_dirs: Vec<String>,
 }
 
 fn compute_rollup(all: &[AuditEntry], days: u64) -> Rollup {
@@ -254,7 +254,11 @@ fn compute_rollup(all: &[AuditEntry], days: u64) -> Rollup {
         .filter(|e| e.matched_rule.as_deref() == Some(crate::intent::BREAKER_RULE))
         .count();
 
-    // Top projects by cwd basename, most active first.
+    // Most active working directories, by cwd basename. NOT projects: state
+    // is stored per project (paths.rs) and `run` reads a single state dir, so
+    // everything here comes from one project — these are its subdirectories.
+    // The label used to say "Top projects", which implied a cross-project view
+    // the command cannot produce.
     let mut proj: HashMap<String, usize> = HashMap::new();
     for e in &win {
         let name = e
@@ -269,7 +273,7 @@ fn compute_rollup(all: &[AuditEntry], days: u64) -> Rollup {
     }
     let mut projects: Vec<(String, usize)> = proj.into_iter().collect();
     projects.sort_by_key(|p| std::cmp::Reverse(p.1));
-    let top_projects = projects.into_iter().take(3).map(|(n, _)| n).collect();
+    let top_dirs = projects.into_iter().take(3).map(|(n, _)| n).collect();
 
     Rollup {
         days,
@@ -280,7 +284,7 @@ fn compute_rollup(all: &[AuditEntry], days: u64) -> Rollup {
         deny: d("deny"),
         backups,
         breaker_trips,
-        top_projects,
+        top_dirs,
     }
 }
 
@@ -433,9 +437,9 @@ fn print_terminal(r: &Report, roll: &Rollup, session: Option<&str>) {
     );
     println!("Backups         {}", roll.backups);
     println!("Breaker trips   {}", roll.breaker_trips);
-    if !roll.top_projects.is_empty() {
-        println!("\n{}", bold("Top projects"));
-        for p in &roll.top_projects {
+    if !roll.top_dirs.is_empty() {
+        println!("\n{}", bold("Top directories"));
+        for p in &roll.top_dirs {
             println!("  {}", p);
         }
     }
@@ -518,8 +522,8 @@ fn print_markdown(r: &Report, roll: &Rollup, session: Option<&str>) {
     );
     println!("- **Backups:** {}", roll.backups);
     println!("- **Breaker trips:** {}", roll.breaker_trips);
-    if !roll.top_projects.is_empty() {
-        println!("- **Top projects:** {}", roll.top_projects.join(", "));
+    if !roll.top_dirs.is_empty() {
+        println!("- **Top projects:** {}", roll.top_dirs.join(", "));
     }
 }
 

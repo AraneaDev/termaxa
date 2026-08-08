@@ -566,16 +566,60 @@ fn fmt_num(n: usize) -> String {
 
 /// Trim a path for the one-line summary, keeping the tail (which is the part
 /// that identifies it) rather than the head.
+///
+/// Counts CHARACTERS, not bytes. `&p[p.len() - 39..]` panicked whenever the
+/// cut landed inside a multi-byte codepoint — 22 of 207 realistic Cyrillic,
+/// CJK and Latin-1 paths in Schipper's sweep. It is reachable from
+/// `preview_for` → `preview::generate` → `hook::run`, so it fired *inside the
+/// gate*, on exactly the non-ASCII Windows profile this module was written
+/// for: a panicking hook is an ungated agent.
 fn short(p: &str) -> String {
-    if p.len() <= 40 {
+    const MAX: usize = 40;
+    let n = p.chars().count();
+    if n <= MAX {
         return p.to_string();
     }
-    format!("…{}", &p[p.len() - 39..])
+    let tail: String = p.chars().skip(n - (MAX - 1)).collect();
+    format!("…{tail}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Schipper review, finding 2. Sweeps every length across non-ASCII
+    /// prefixes so the truncation point lands mid-codepoint; the old byte
+    /// slice panicked on 22 of these.
+    #[test]
+    fn short_never_panics_on_non_ascii_paths() {
+        for prefix in [
+            "/home/Пользователь/",
+            "/home/user/用户文档/",
+            "/home/Jörg/Bücher/",
+            "C:\\Users\\Пользователь\\Рабочий стол\\",
+            "/home/user/📁/",
+        ] {
+            for n in 0..80 {
+                let p = format!("{prefix}{}", "a".repeat(n));
+                let s = short(&p);
+                assert!(s.chars().count() <= 40, "not trimmed: {s}");
+                if p.chars().count() > 40 {
+                    assert!(s.starts_with('…'), "expected ellipsis: {s}");
+                    assert!(p.ends_with(
+                        &s[s.char_indices().nth(1).map(|(i, _)| i).unwrap_or(s.len())..]
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_leaves_ascii_behaviour_unchanged() {
+        assert_eq!(short("/tmp/x"), "/tmp/x");
+        let long = format!("/home/user/{}", "a".repeat(60));
+        assert_eq!(short(&long).chars().count(), 40);
+        assert!(short(&long).ends_with("aaa"));
+    }
 
     #[test]
     fn extracts_targets_across_shells() {

@@ -213,7 +213,7 @@ breaker trips       1
 
 Insight
 ──────────────────────────────────────────
-The breaker blocked file-delete 3 times in this scope.
+The breaker blocked file-delete 1 time in this scope.
 
 This often indicates:
 • generated files being cleaned
@@ -230,7 +230,7 @@ Recent events
 ✓ cargo test
 
 Backups   : 3 — rollback available (`termaxa backups`)
-Risk      : Medium  (deny×3 + escalation×2 + ask×1 = 9)
+Risk      : High    (deny×3 + escalation×2 + ask×1 = 13)
 
 Last 30 days
 ──────────────────────────────────────────
@@ -240,10 +240,10 @@ Decisions       ✓ 302 · ? 31 · ✗ 8
 Backups         19
 Breaker trips   3
 
-Top projects
-  backend-api
-  termaxa
-  website
+Top directories
+  api
+  crates/core
+  web
 ```
 
 One command, no flags: what the agent tried, what got blocked, what's recoverable — plus a 30-day view. Note that *destructive intents* and *breaker trips* are separate numbers: a legitimate `rm -rf ./build` is a classified intent, not a trip.
@@ -362,7 +362,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model.
 
 ## Contributing
 
-Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is ~5,500 lines of dependency-light Rust — `src/policy.rs` and `src/preview.rs` are the best places to start reading.
+Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is ~6,900 lines of dependency-light Rust — `src/policy.rs` and `src/preview.rs` are the best places to start reading.
 
 If you can make an agent get past the gate in a way that isn't already documented above, that's the most useful contribution you can make: [open an issue](https://github.com/termaxa/termaxa/issues) or email security@termaxa.com.
 

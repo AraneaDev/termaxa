@@ -9,9 +9,12 @@
 /// every segment, let the most dangerous one govern.
 ///
 /// Scope (deliberate):
-///   - Splits on `&&`, `||`, `;`, `|`, and newlines, outside quotes.
-///   - Single `&` is NOT a separator (it appears in redirections like 2>&1
-///     far more often than as a background operator).
+///   - Splits on `&&`, `||`, `;`, `|`, `&`, and newlines, outside quotes.
+///   - A single `&` IS a separator. Until v0.14.1 it was not — the reasoning
+///     was that `2>&1` is more common than backgrounding, which is true but
+///     answered the wrong question: an allow rule only has to be wrong once.
+///     Redirection forms are excluded by shape instead (see
+///     `is_redirection_amp`), which costs nothing and closes the bypass.
 ///   - `$(...)` and backticks cannot be statically analyzed — their PRESENCE
 ///     is reported so the context engine can escalate, rather than
 ///     pretending the contents were checked.
@@ -43,6 +46,14 @@ pub fn split_segments(s: &str) -> Vec<String> {
                 flush(&mut segments, &mut cur);
                 i += 1; // consume second &
             }
+            // A lone `&` IS a separator — it backgrounds the segment to its
+            // left and starts a new command to its right. Treating it as
+            // ordinary text reopened the v0.6.1 bypass on one character:
+            // `git status & rm -rf /` stayed a single segment and matched the
+            // `git status*` allow rule. The redirection forms it also appears
+            // in are `2>&1` / `>&2` / `<&-` (preceded by `>` or `<`) and
+            // `&>file` / `&>>file` (followed by `>`); those are not separators.
+            '&' if !is_redirection_amp(&chars, i) => flush(&mut segments, &mut cur),
             '|' => {
                 flush(&mut segments, &mut cur);
                 if i + 1 < chars.len() && chars[i + 1] == '|' {
@@ -56,6 +67,15 @@ pub fn split_segments(s: &str) -> Vec<String> {
     }
     flush(&mut segments, &mut cur);
     segments
+}
+
+/// Is the `&` at `i` part of a redirection rather than a command separator?
+/// `2>&1`, `1>&2`, `<&-` have `>` or `<` immediately before; `&>log` and
+/// `&>>log` have `>` immediately after.
+fn is_redirection_amp(chars: &[char], i: usize) -> bool {
+    let prev_is_redirect = i > 0 && matches!(chars[i - 1], '>' | '<');
+    let next_is_redirect = chars.get(i + 1) == Some(&'>');
+    prev_is_redirect || next_is_redirect
 }
 
 fn flush(segments: &mut Vec<String>, cur: &mut String) {
@@ -118,8 +138,46 @@ mod tests {
 
     #[test]
     fn redirections_survive() {
-        // single & must not split: 2>&1 is a redirection, not an operator
+        // `&` inside a redirection is not an operator
         assert_eq!(split_segments("cmd 2>&1"), vec!["cmd 2>&1"]);
+        assert_eq!(split_segments("cmd >&2"), vec!["cmd >&2"]);
+        assert_eq!(split_segments("cmd &> log"), vec!["cmd &> log"]);
+        assert_eq!(split_segments("cmd &>> log"), vec!["cmd &>> log"]);
+        assert_eq!(split_segments("cmd <&-"), vec!["cmd <&-"]);
+        assert_eq!(
+            split_segments("make 2>&1 | tee log"),
+            vec!["make 2>&1", "tee log"]
+        );
+    }
+
+    /// Schipper review, finding 1. `&` backgrounds the left-hand command and
+    /// starts a new one; leaving it unsplit meant the whole line matched the
+    /// `git status*` allow rule and was ALLOWED.
+    #[test]
+    fn a_lone_ampersand_splits() {
+        assert_eq!(
+            split_segments("git status & rm -rf /"),
+            vec!["git status", "rm -rf /"]
+        );
+        assert_eq!(split_segments("ls & rm -rf /"), vec!["ls", "rm -rf /"]);
+        assert_eq!(split_segments("npm run dev &"), vec!["npm run dev"]);
+        assert_eq!(split_segments("a & b & c"), vec!["a", "b", "c"]);
+        // no spaces required, exactly as the shell reads it
+        assert_eq!(
+            split_segments("echo hi&rm -rf /"),
+            vec!["echo hi", "rm -rf /"]
+        );
+    }
+
+    /// The bypass was reachable because the two splitters disagreed about the
+    /// same string. Since v0.14.1 `intent` calls this function, so the only
+    /// way they can diverge again is if this test is deleted.
+    #[test]
+    fn newlines_split_too() {
+        assert_eq!(
+            split_segments("git status\nrm -rf /"),
+            vec!["git status", "rm -rf /"]
+        );
     }
 
     #[test]
