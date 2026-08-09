@@ -21,16 +21,41 @@ Termaxa works by *cooperative interception*: it sees commands that flow through 
 
 If your threat model includes an agent *actively trying to evade you*, you need OS-level isolation — containers, seccomp, VMs, restricted credentials. Termaxa is complementary to those, not a replacement. **Run both.** Termaxa is the windshield; a sandbox is the seatbelt.
 
+### Where the line is, and what it costs
+
+The distinction is **intent to evade**, not degree of misbehaviour.
+
+Termaxa is built for an agent that is erring or misbehaving but still doing what it appears to be doing — running the command it says it is running, through the shell, in the open. An agent that is *trying* to get past the gate has execution paths the hook cannot see, and no amount of rule-writing closes them.
+
+That boundary is not a hedge, and it has a measurable price. In August 2026, Tim Schipper ([@AraneaDev](https://github.com/AraneaDev)) ran an adversarial corpus against v0.14.1 with the starter policy: 22 commands, each destructive or gate-disabling, single command, fresh session. The result was **7 `allow`, 15 `ask`, 0 `deny`** — and since an auto-approving agent UI answers `ask` for you, all 22 reach execution.
+
+Read that as a statement about the design rather than about the implementation. Policy matching is substring-based, so every one of those 22 is closable with a rule, and the next 22 spellings will need 22 more. A rule-per-spelling gate cannot win an adversarial game. It is not trying to.
+
+**The decision rule this gives us**, and the one we apply to every bypass report:
+
+> Would a cooperative agent, making an ordinary mistake, hit this?
+
+If yes, it is a bug and it gets fixed regardless of threat model — a careless agent hits `rm -r -f /` and `git push -f` exactly as readily as a hostile one. If it only fires under deliberate evasion — quoting a command name to dodge a rule, `bash -c` to hide a payload, a SQL comment inside a keyword — it is a documented limit, and this section is that documentation.
+
+We state this because it would be very convenient to call every bypass "out of scope," and that is exactly when a framing deserves suspicion.
+
 ## Known limitations that affect safety
 
-- **Shell parsing is heuristic.** Termaxa splits on `&&`, `||`, `;`, `|` and detects `$(...)`/backticks (escalating those to a human). It does not fully parse subshells `( )`, process substitution, or variable-expanded command names. Unparseable constructs are judged conservatively (the policy default, which ships as `ask`), but "conservative" is not "guaranteed."
+- **Shell parsing is heuristic.** Termaxa splits on `&&`, `||`, `;`, `|`, a lone `&` and newlines, and detects `$(...)`/backticks (escalating those to a human). It does not fully parse subshells `( )`, process substitution, or variable-expanded command names. Unparseable constructs are judged conservatively (the policy default, which ships as `ask`), but "conservative" is not "guaranteed."
+- **The policy engine and the intent classifier read a command differently.** The classifier strips quotes before tokenizing; policy matching normalizes whitespace and case but matches against a string that still contains them. So `"rm" -rf /` is classified as a file-delete while missing the `rm -rf /*` deny rule. The layer that understands the command is not always the layer that blocks it. Being fixed by matching rules against the tokenized form as well as the raw string.
+- **Allow rules are prefixes, not commands.** A rule like `ls*` matches any command *starting* with those characters — including `lsof` and `lsblk`. Rules that end in a wildcard immediately after the command name are broader than they look; prefer a trailing space (`ls *`).
+- **Output redirection is not modelled.** `>` and `>>` receive no split, no intent classification, no preview and no backup, so a read-only allow rule can cover a command that destroys a file (`cat /dev/null > .env`). The same applies to overwrite via `cp`, `mv`, `tee` and `dd`. This is the largest known gap; see issues #12 and #14.
+- **Termaxa does not defend its own configuration.** `.termaxa/` is an ordinary directory. A command matching a read-only allow rule can overwrite `policy.yaml` with a permissive one, or truncate the audit log (which is also the circuit breaker's memory). A *malformed* policy fails closed — `Policy::load` errors and the command is blocked — so the gap is the valid-but-permissive case. Note also that the hook installs with a `Bash` matcher, so an agent's file-writing tools can reach these paths without producing a shell command at all. Mitigation in progress; in the meantime, `context_escalates` still runs regardless of policy, so a destructive command cannot reach silent `allow` even under a fully permissive policy — but it can reach `ask`.
 - **Previews are best-effort and read-only.** Postgres estimates come from planner statistics and can be stale; a `DELETE ... WHERE` is reported as filtered without computing the exact count. Terraform previews trust `terraform plan`. A preview never executes the analyzed statement.
 
   *This claim was false from v0.6.1 to v0.14.0.* The Postgres preview re-invoked `psql` with the user's own flags, and psql honours `-f` and `-c` in one invocation — so `psql -d db -f wipe.sql -c "DROP TABLE t"` made the preview execute `wipe.sql`, including on commands the policy then denied. Fixed in v0.14.1 by rebuilding the invocation from an allowlist of connection parameters. Reported by Tim Schipper.
-- **Backups have boundaries.** `pg_dump`/`psql` and `git` must be on PATH. `rm` insurance resolves the command head, so `/bin/rm` and `/usr/bin/rm` are covered; shell aliases and variable-expanded command names are not. (Note that the *intent classifier* is stricter than the backup engine here — it keys on the raw first token, so `sudo rm`, `/bin/rm` and `env rm` are insured but not classified, and therefore do not advance the circuit breaker's counter.) Remote Terraform state is not backed up (its backend versions it). There is no backup retention/pruning yet.
-- **Policy is only as good as you write it.** The starter policy is a sensible default, not a guarantee. Review it. `default: ask` fails closed, which is the safe direction, but an over-broad `allow` rule can still wave through something you'd rather catch.
+- **The preview is generated before the decision is returned.** Backups correctly never fire on `deny`, but previews do — so a denied `terraform destroy` still causes Termaxa to run `terraform plan -destroy` in the working directory, which initializes providers and evaluates `external` data sources. The psql case above was one instance of this; the structure is the class. Being fixed by generating the preview after the deny path returns.
+- **Backups have boundaries.** `pg_dump`/`psql` and `git` must be on PATH. `rm` insurance resolves the command head, so `/bin/rm` and `/usr/bin/rm` are covered; shell aliases and variable-expanded command names are not. (Note that the *intent classifier* is stricter than the backup engine here — it keys on the raw first token, so `sudo rm`, `/bin/rm` and `env rm` are insured but not classified, and therefore do not advance the circuit breaker's counter.) Compound commands are insured for the first insurable segment only. Remote Terraform state is not backed up (its backend versions it). There is no backup retention/pruning yet.
+- **Policy matching is case-insensitive.** This is usually what you want — `*rm -rf*` catches `rm -RF`, and `*drop table*` catches `DROP TABLE`. The cost is that a rule cannot distinguish `-D` from `-d`, so flag pairs whose case carries the meaning (`git branch -d/-D`, `git checkout -b/-B`, `git branch -m/-M`) collapse into one rule, and the action is chosen for the safer of the two.
+- **Policy is only as good as you write it.** The starter policy is a sensible default, not a guarantee. Review it. `default: ask` fails closed, which is the safe direction, but an over-broad `allow` rule can still wave through something you'd rather catch. Note that ordering is load-bearing: matching is first-wins, so a broad allow prefix placed above a deny rule makes that deny unreachable. The starter policy puts hard stops first for this reason.
+- **`ask` degrades to `allow` under auto-approving agent UIs.** Several agent harnesses can be configured to answer prompts automatically. Where that is on, treat every `ask` in your policy as an `allow` — which is why the starter policy denies broad recursive deletes outright rather than asking.
 - **Fail-open on plumbing.** If the hook receives malformed input, Termaxa steps aside rather than breaking your session. This is deliberate (a gate that bricks sessions gets uninstalled) but means a sufficiently broken invocation is ungoverned.
-- **The circuit breaker is per-session, and the session id can rotate.** The breaker counts repeated destructive intent within one agent session and escalates further variants to `deny`. If the harness rotates its session id mid-run (observed with both Claude Code and Cursor), the counter resets. It classifies command *intent* (file-delete, db-destroy, git-force, infra-destroy), including deletes hidden behind `find -exec`, `xargs`, and `unlink` — but it is a speed bump against retry-flailing, not a guaranteed cap, and it only sees commands that reach the shell hook.
+- **The circuit breaker is per-session, and the session id can rotate.** The breaker counts repeated destructive intent within one agent session and escalates further variants to `deny`. If the harness rotates its session id mid-run (observed with both Claude Code and Cursor), the counter resets. It classifies command *intent* (file-delete, db-destroy, git-force, infra-destroy), including deletes hidden behind `find -exec`, `xargs`, and `unlink` — but it is a speed bump against retry-flailing, not a guaranteed cap, and it only sees commands that reach the shell hook. It also only escalates `ask` to `deny`: a command the policy already allows cannot be rescued by correct classification.
 - **Hook dialects can drift.** Agents change their hook APIs between versions —
   observed live: Cursor 3.11 renamed its events (`preToolUse`/`postToolUse`) and
   Termaxa silently stopped gating it until v0.11.4, while every unit test stayed
@@ -44,8 +69,9 @@ If your threat model includes an agent *actively trying to evade you*, you need 
 ## Design choices that support safety
 
 - **Fail closed on policy** (unmatched → `ask`), fail open on plumbing (broken hook input → step aside).
-- **One-way escalation:** context signals and the circuit breaker can only raise a verdict (allow→ask, ask→deny), never lower one. Heuristics can't weaken an explicit rule.
+- **One-way escalation:** context signals and the circuit breaker can only raise a verdict (allow→ask, ask→deny), never lower one. Heuristics can't weaken an explicit rule. This holds even against a permissive policy file: a destructive command cannot reach silent `allow`.
 - **Backups precede execution** on both `run` and `hook`, and never fire on `deny` (nothing runs).
+- **One parser per grammar.** The policy engine and the intent classifier share `shell::split_segments`, and the backup engine and preview share `delete::command_head`. Two engines reading the same command differently has produced three separate bugs; the fix each time was to delete the duplicate rather than align it.
 - **State outside the repo:** logs and backups live in `~/.termaxa/`, so a `git reset --hard` — or an agent deleting the project folder — can't destroy your audit trail. (This is fixed as of v0.8 — earlier versions kept state in-repo.)
 - **Append-only audit:** every attempt, including blocked ones, is recorded and never overwritten.
 
@@ -53,7 +79,10 @@ If your threat model includes an agent *actively trying to evade you*, you need 
 
 If you find a way to bypass a policy that *should* hold (e.g. a compound-command or quoting trick that sneaks a destructive command past a matching `deny` rule), please report it.
 
-- Open a GitHub issue for non-sensitive reports, or
-- Email **security@termaxa.com** for anything you'd rather disclose privately.
+- Use [private vulnerability reporting](https://github.com/termaxa/termaxa/security/advisories/new) for anything sensitive — it opens a private thread with the maintainers, or
+- Email **security@termaxa.com**, or
+- Open a GitHub issue for non-sensitive reports.
 
-Bypass reports are the most valuable contribution you can make. The compound-command splitting in v0.7 exists because the first live agent found exactly such a bypass within minutes — that finding is now a named regression test. The v0.11.1 intent classifier for `find -exec`/`xargs` deletes exists for the same reason: a live Cursor agent found the gap. And the v0.11.4 Cursor 3.11 fix exists because a live payload capture showed the gate had gone silent. We'd rather have yours the same way.
+Before reporting, please check the decision rule above: a bypass that only fires under deliberate evasion is a documented limit rather than a bug. Report it anyway if it surprises you — the boundary itself is worth arguing about, and the limitations list above exists because people did.
+
+Bypass reports are the most valuable contribution you can make. The compound-command splitting in v0.7 exists because the first live agent found exactly such a bypass within minutes — that finding is now a named regression test. The v0.11.1 intent classifier for `find -exec`/`xargs` deletes exists for the same reason: a live Cursor agent found the gap. The v0.11.4 Cursor 3.11 fix exists because a live payload capture showed the gate had gone silent. And the whole of v0.14.1, plus most of the limitations listed above, exists because Tim Schipper read the source and then attacked it. We'd rather have yours the same way.
