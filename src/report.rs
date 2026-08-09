@@ -523,7 +523,7 @@ fn print_markdown(r: &Report, roll: &Rollup, session: Option<&str>) {
     println!("- **Backups:** {}", roll.backups);
     println!("- **Breaker trips:** {}", roll.breaker_trips);
     if !roll.top_dirs.is_empty() {
-        println!("- **Top projects:** {}", roll.top_dirs.join(", "));
+        println!("- **Top directories:** {}", roll.top_dirs.join(", "));
     }
 }
 
