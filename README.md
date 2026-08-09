@@ -369,3 +369,5 @@ If you can make an agent get past the gate in a way that isn't already documente
 ## License
 
 Dual-licensed under either [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.
+Contributions are accepted under the same terms — dual MIT/Apache-2.0, at the
+user's option. No CLA.
