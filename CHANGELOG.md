@@ -2,6 +2,123 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.14.1 — security patch: the preview could execute the command
+
+An unsolicited end-to-end code review by **Tim Schipper** ([@AraneaDev](https://github.com/AraneaDev)) — who compiled Termaxa's own functions into a standalone harness rather than arguing from a reading — found ten issues in v0.14.0. This release fixes the ones that fail in the quiet direction. **Anyone using the Postgres preview against a real database should upgrade.**
+
+### Fixed
+
+- **The Postgres preview executed the user's SQL file.** (CVE-class: unintended
+  code execution in a safety tool.) `pg::introspect` copied the user's argv and
+  stripped only `-c`. psql honours `-f` and `-c` in the same invocation, so
+  `psql -d shop -f wipe.sql -c "DROP TABLE users"` made the *preview* run
+  `wipe.sql`. `hook::run` generates the preview before returning a decision, so
+  this happened on commands Termaxa then **denied** — the gate performed the
+  damage it had just blocked. Confirmed end-to-end against a live database.
+
+  The fix is not "also strip `-f`": a denylist loses. `-o` truncates an
+  arbitrary file, `-L` writes one, `-W` blocks on a password prompt, and the
+  attached form `-cSQL` slipped past an equality check on `-c` and re-executed
+  the destructive statement itself. The invocation is now **rebuilt from an
+  allowlist** of connection parameters (`-h/-p/-U/-d` plus a positional
+  dbname), so nothing unrecognised can reach the child process. `-w` is forced
+  so a preview can never hang on a prompt, and the catalog query runs under
+  `default_transaction_read_only`.
+
+- **A harmless psql flag silently voided insurance.** The same argv was passed
+  to `pg_dump`, whose flag namespace disagrees with psql's: psql's `-t`
+  (tuples-only) is pg_dump's `--table`, and `-X`, `-A`, `-1` are not pg_dump
+  options at all. pg_dump exited non-zero, `backup::take` returned `Err`, and
+  `hook` ignores `Err` — so `psql -X -d shop -c "TRUNCATE users"` got **no
+  backup** while the identical command without `-X` got one. Same shape as the
+  v0.14.0 bug where path *syntax* decided whether a backup existed. The restore
+  path had the same passthrough, and indexed `conn[0]` on a possibly-empty
+  array; it now derives its connection from the original command through the
+  same allowlist, which also makes pre-0.14.1 backup records safe to restore.
+
+- **The trench-coat bypass reopened on a single `&`.** `shell::split_segments`
+  treated `&&` as a separator but not a lone `&`, so `git status & rm -rf /`
+  stayed one segment, matched the starter policy's `git status*` rule, and was
+  **allowed**. The original reasoning — that `2>&1` is more common than
+  backgrounding — was true but answered the wrong question: an allow rule only
+  has to be wrong once. Redirection forms (`2>&1`, `>&2`, `<&-`, `&>log`) are
+  now excluded by shape instead.
+
+- **One splitter, not two.** `intent.rs` carried its own copy that split on a
+  lone `&` but not on newlines, while `shell.rs` did the reverse. So
+  `git status & rm -rf /` was classified correctly and allowed anyway, and
+  `"git status\nrm -rf /"` was denied by policy but invisible to the circuit
+  breaker's counter. `intent` now calls `shell::split_segments`. Two parsers
+  for one grammar is the failure `delete::command_head` was introduced to end.
+
+- **`delete::short()` panicked on non-ASCII paths.** `&p[p.len() - 39..]`
+  byte-sliced a filesystem path, so the cut could land inside a multi-byte
+  codepoint — 22 of 207 realistic Cyrillic, CJK and Latin-1 paths in
+  Schipper's sweep. It is reachable from `preview_for` → `preview::generate` →
+  `hook::run`, so it fired *inside the gate*, on exactly the non-ASCII Windows
+  profile the module was written for. A panicking hook is an ungated agent.
+
+- **Starter policy ordering.** Read-only allows sat above the destructive
+  denies, and matching is first-wins, so `git branch -D main` matched
+  `git branch*` → **allow**, and `echo $(rm -rf /)` matched `echo *` before
+  `*rm -rf*` could see it. Hard stops now come first; put your own exceptions
+  above the deny you want them to override. `git branch -d/-D` is now an
+  explicit `ask` (matching is case-insensitive, so a rule cannot separate the
+  two — the action is chosen for the safer one).
+
+- **`examples/policy.yaml` was materially weaker than what `init` writes** —
+  28 rules against 44, missing every broad delete deny and the whole
+  `circuit_breaker` block, with nothing to signal it was thinner. It is now
+  generated from `STARTER_POLICY`, and a test fails the build if they drift.
+
+### Documentation
+
+Four claims that were false, all under headings asserting the opposite:
+
+- `SECURITY.md` said "a preview never executes the analyzed statement." From
+  v0.6.1 to v0.14.0 it could. The correction now sits in the file, dated.
+- `SECURITY.md` said `/bin/rm` is not insured. Since v0.14.0 it is — the
+  *classifier* is what misses it. The two engines' actual boundary is now
+  stated.
+- The README report sample's risk line read `Medium (... = 9)` while its own
+  counts give 13, which is the High band — under a heading claiming every line
+  is a fact with a source.
+- The README's "Top projects" cannot be produced: state is per-project and
+  `report::run` reads one state dir, so those are subdirectories of a single
+  project. Renamed to "Top directories" in the output and the sample.
+- README line count corrected (~5,500 → ~7,200).
+
+### Upgrade note — existing projects keep the old policy
+
+`termaxa init` writes `.termaxa/policy.yaml` once and never rewrites it, so
+**upgrading the binary does not reorder an existing project's policy.** The
+starter-policy fix above reaches new projects only. To pick it up in a project
+you already have, diff your policy against the new starter and move the
+destructive denies above the read-only allows:
+
+```
+termaxa init            # in an empty directory, to see the new ordering
+```
+
+Then reorder your own file, or delete `.termaxa/policy.yaml` and re-run `init`
+if you have not customised it. Check the result with:
+
+```
+termaxa check "git branch -D main"      # expect ask, not allow
+termaxa check "echo \$(rm -rf /)"        # expect deny, not allow
+```
+
+The code fixes (psql, `&`, `short()`) need no action — they ship with the
+binary.
+
+### Still open from the same review
+
+Filed rather than fixed, because they need design rather than a patch: the
+process-cwd leak into every engine except policy resolution (#15), output
+redirection modelled nowhere so `cat /dev/null > .env` is still allowed (#14),
+compound commands insuring only the first segment, `notify` posting command
+text unredacted, and intent classification keyed on the raw first token.
+
 ## v0.14.0 — what a delete actually costs
 
 Every other preview engine answers "what will this destroy?" with a real
