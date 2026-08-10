@@ -23,7 +23,26 @@ pub struct Preview {
 /// supply: in hook mode the agent may spawn us from anywhere (see the Cursor
 /// cwd bug). Callers that know the root pass it; callers that don't pass None
 /// and the signal is omitted rather than guessed.
-pub fn generate(command: &str, root: Option<&std::path::Path>) -> Option<Preview> {
+/// Build the consequence preview for a command.
+///
+/// `live` controls whether the preview may execute anything. When false, only
+/// static analysis runs: parsing the command, resolving paths, scanning the
+/// filesystem. No subprocess is spawned.
+///
+/// SECURITY (v0.14.2). `hook::run` generates the preview before returning a
+/// decision, so a DENIED command still reached this function. v0.14.1 fixed
+/// what the Postgres preview did with the arguments it was handed; it left
+/// standing the structure that let a denied command reach a subprocess at all.
+/// Confirmed with a stub `terraform` on PATH: a denied `terraform destroy`
+/// caused `terraform plan -destroy` to run in the agent's working directory,
+/// which initializes providers and evaluates `external` data sources.
+///
+/// The fix is not to skip the preview on deny — the denial message is more
+/// useful with it ("DROP TABLE is blocked | DROP users"), and the delete
+/// preview never spawns anything. It is to make "may this execute?" an
+/// argument, so the caller that already knows the verdict decides.
+/// Reported by Tim Schipper.
+pub fn generate(command: &str, root: Option<&std::path::Path>, live: bool) -> Option<Preview> {
     // Deletes are checked across the whole command first: a compound like
     // `mkdir x && rm -rf /` must not have its delete masked by an earlier
     // segment producing a preview.
@@ -33,24 +52,33 @@ pub fn generate(command: &str, root: Option<&std::path::Path>) -> Option<Preview
     // Compound commands: preview the first segment that has one.
     let segments = crate::shell::split_segments(command);
     if segments.len() > 1 {
-        return segments.iter().find_map(|s| generate_one(s));
+        return segments.iter().find_map(|s| generate_one(s, live));
     }
-    generate_one(command)
+    generate_one(command, live)
 }
 
-fn generate_one(command: &str) -> Option<Preview> {
+fn generate_one(command: &str, live: bool) -> Option<Preview> {
     let cmd = crate::policy::normalize(command);
     if cmd.starts_with("git push") {
-        return git_push_preview(&cmd);
+        // Entirely subprocess-derived: `git rev-parse`, `git log`. Nothing
+        // static to fall back on, so a non-live preview has no answer.
+        return if live { git_push_preview(&cmd) } else { None };
     }
     if cmd.starts_with("psql") || cmd.contains(" psql ") {
-        return crate::pg::preview_for(command);
+        return crate::pg::preview_for(command, live);
     }
     for bin in ["terraform", "tofu"] {
         if cmd.starts_with(&format!("{} apply", bin))
             || cmd.starts_with(&format!("{} destroy", bin))
         {
-            return terraform_preview(bin, cmd.starts_with(&format!("{} destroy", bin)));
+            // `terraform plan` is the confirmed case: it initializes
+            // providers and evaluates `external` data sources, which execute
+            // arbitrary programs.
+            return if live {
+                terraform_preview(bin, cmd.starts_with(&format!("{} destroy", bin)))
+            } else {
+                None
+            };
         }
     }
     None
@@ -263,5 +291,51 @@ Plan: 2 to add, 0 to change, 1 to destroy.
     fn no_changes_is_zeroes() {
         let (a, c, d, _) = parse_tf_plan("No changes. Your infrastructure matches.").unwrap();
         assert_eq!((a, c, d), (0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod live_gate_tests {
+    use super::*;
+
+    /// Schipper review, finding 4, confirmed with a stub `terraform` on PATH:
+    /// a DENIED `terraform destroy` still caused `terraform plan -destroy` to
+    /// run in the agent's working directory. `hook::run` generates the preview
+    /// before returning the decision, so denying is what made it worse — the
+    /// more correctly the gate behaved, the more confidently it ran the plan.
+    #[test]
+    fn a_non_live_preview_spawns_nothing_for_terraform() {
+        assert!(generate("terraform destroy -auto-approve", None, false).is_none());
+        assert!(generate("tofu destroy", None, false).is_none());
+    }
+
+    /// Same structure, the other two subprocess previews.
+    #[test]
+    fn a_non_live_preview_spawns_nothing_for_git_push() {
+        assert!(generate("git push --force origin main", None, false).is_none());
+    }
+
+    /// The reason NOT to simply skip the preview on deny: static analysis is
+    /// where the useful part of the denial message comes from. A denied
+    /// `DROP TABLE` should still say which table, without connecting to the
+    /// database it was just blocked from.
+    #[test]
+    fn a_non_live_preview_keeps_the_static_sql_analysis() {
+        let p = generate(r#"psql -d shop -c "DROP TABLE users""#, None, false)
+            .expect("static SQL analysis must still produce a preview");
+        assert!(
+            p.summary.contains("users"),
+            "denial reason lost its detail: {}",
+            p.summary
+        );
+    }
+
+    /// Deletes never spawned anything, so they are unaffected either way —
+    /// asserted so a future refactor can't quietly gate them too.
+    #[test]
+    fn deletes_preview_identically_whether_live_or_not() {
+        let live = generate("rm -rf /tmp/tmx-none-such", None, true);
+        let stat = generate("rm -rf /tmp/tmx-none-such", None, false);
+        assert_eq!(live.map(|p| p.summary), stat.map(|p| p.summary));
     }
 }

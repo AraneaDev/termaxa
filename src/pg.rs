@@ -29,7 +29,10 @@ pub enum Destructive {
     },
 }
 
-pub fn preview_for(command: &str) -> Option<Preview> {
+/// `live` gates the catalog query only. Static analysis of the SQL always
+/// runs, so a denied command still gets "DROP users" in its reason string —
+/// it just doesn't cause a connection to the database it was blocked from.
+pub fn preview_for(command: &str, live: bool) -> Option<Preview> {
     let tokens = shell_tokens(command);
     if tokens.first().map(|t| !t.ends_with("psql") && t != "psql") != Some(false) {
         return None; // not a psql invocation
@@ -55,7 +58,7 @@ pub fn preview_for(command: &str) -> Option<Preview> {
                         t,
                         if *cascade { " CASCADE" } else { "" }
                     ));
-                    let info = introspect(command, t);
+                    let info = if live { introspect(command, t) } else { None };
                     if let Some(info) = &info {
                         live_reached = true;
                         lines.push(format!("    rows (estimate) : {}", info.rows_display()));
@@ -95,7 +98,7 @@ pub fn preview_for(command: &str) -> Option<Preview> {
                         t,
                         if *cascade { " CASCADE" } else { "" }
                     ));
-                    if let Some(info) = introspect(command, t) {
+                    if let Some(info) = live.then(|| introspect(command, t)).flatten() {
                         live_reached = true;
                         lines.push(format!(
                             "    rows to erase (estimate) : {}",
@@ -125,7 +128,7 @@ pub fn preview_for(command: &str) -> Option<Preview> {
                         "  DELETE FROM {} — NO WHERE CLAUSE (deletes every row)",
                         table
                     ));
-                    if let Some(info) = introspect(command, table) {
+                    if let Some(info) = live.then(|| introspect(command, table)).flatten() {
                         live_reached = true;
                         lines.push(format!(
                             "    rows to delete (estimate) : {}",
@@ -639,8 +642,8 @@ mod tests {
     #[test]
     fn ignores_safe_sql_and_non_psql() {
         assert!(parse_destructive("SELECT * FROM users").is_empty());
-        assert!(preview_for("git push origin main").is_none());
-        assert!(preview_for("psql -c 'SELECT 1'").is_none());
+        assert!(preview_for("git push origin main", true).is_none());
+        assert!(preview_for("psql -c 'SELECT 1'", true).is_none());
     }
 
     #[test]

@@ -219,7 +219,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
 
             let mut preview_summary = None;
             let root = resolved.as_ref().and_then(|p| p.project_dir.parent());
-            if let Some(pv) = preview::generate(&cmd, root) {
+            if let Some(pv) = preview::generate(&cmd, root, decision.action != policy::Action::Deny)
+            {
                 println!("\n{}", ui::bold(&pv.title));
                 for l in &pv.lines {
                     println!("{}", l);

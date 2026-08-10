@@ -418,8 +418,12 @@ pub fn run() -> Result<()> {
     // Pass the project root so the delete preview can answer "is this target
     // outside the project?" — the process cwd can't supply it, because the
     // agent may spawn us from anywhere (the Cursor cwd bug).
-    let preview_summary =
-        crate::preview::generate(&command, paths.project_dir.parent()).map(|p| p.summary);
+    let preview_summary = {
+        // A denied command must not cause a subprocess. The preview is still
+        // generated — statically — so the denial reason keeps its detail.
+        let live = decision.action != crate::policy::Action::Deny;
+        crate::preview::generate(&command, paths.project_dir.parent(), live).map(|p| p.summary)
+    };
 
     // Insure before allowing: PreToolUse runs before execution, so a backup
     // taken here is guaranteed to predate the command. Never for deny.
