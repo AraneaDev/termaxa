@@ -21,6 +21,78 @@ version: 1
 default: ask
 
 rules:
+  # ---- self-defence: the gate's own configuration ----
+  # A gate that will happily rewrite its own rules is a suggestion. These
+  # come FIRST because first-match-wins: `echo *` at the bottom of this file
+  # would otherwise allow
+  #     echo 'default: allow' > .termaxa/policy.yaml
+  # and every command after it is judged by the agent's own policy.
+  #
+  # `*` matches any run of characters, so one rule covers both path
+  # separators: `.termaxa/policy.yaml` and `.termaxa\policy.yaml`.
+  #
+  # This closes the SHELL path only. An agent's file-writing tool (Write,
+  # Edit, the editor's apply-patch) never reaches the hook — the Claude Code
+  # hook is registered with `"matcher": "Bash"` — so no rule here can see it.
+  # `termaxa doctor` fingerprints the policy for exactly that reason: what
+  # cannot be blocked can at least be noticed.
+  #
+  # Reads are denied too, except for the handful listed below, because
+  # separating reads from writes in general would mean enumerating every read
+  # command. To add one, put it in that group — NOT at the top of the file.
+  - match: "*.claude*settings*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+  - match: "*.cursor*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+  - match: "*.codex*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+  - match: "*.github*hooks*"
+    action: deny
+    reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+
+  # The policy is an in-repo artifact, reviewable in PRs, and the deny below
+  # would otherwise make that workflow impossible: `git add .termaxa/…`,
+  # `git diff .termaxa/…` and `cp .termaxa/policy.yaml backup.yaml` are all
+  # blocked by it. These exceptions give the workflow back.
+  #
+  # The test for inclusion is that the `.termaxa` path can only be READ, never
+  # written. diff/status/log/show/cat read it; add/commit stage what is
+  # already on disk. `checkout`, `restore` and `config` are absent on purpose
+  # — overwriting the working tree from a ref is exactly what the deny is for,
+  # so restoring a clobbered policy stays a thing you do yourself.
+  #
+  # `cat` and `cp` are anchored on the SOURCE path so the copy can only go the
+  # safe way: `cp .termaxa/policy.yaml backup.yaml` matches,
+  # `cp backup.yaml .termaxa/policy.yaml` does not.
+  #
+  # Position matters twice over. Above the deny, or these never fire. Below
+  # the four denies above, because a trailing `*` swallows a redirect —
+  #     cat .termaxa/policy.yaml > .claude/settings.json
+  # matches `cat .termaxa*` too, and at the top of the file it would allow
+  # that and shadow the rule that exists to stop it.
+  - match: "git diff *.termaxa*"
+    action: allow
+  - match: "git status *.termaxa*"
+    action: allow
+  - match: "git log *.termaxa*"
+    action: allow
+  - match: "git show *.termaxa*"
+    action: allow
+  - match: "git add *.termaxa*"
+    action: allow
+  - match: "git commit *.termaxa*"
+    action: allow
+  - match: "cat .termaxa*"
+    action: allow
+  - match: "cp .termaxa*"
+    action: allow
+  - match: "*.termaxa*"
+    action: deny
+    reason: "Termaxa's own config is off limits — that is the gate. Edit it yourself."
+
   # ---- destructive: hard stops ----
   - match: "git push*--force*"
     action: deny
@@ -28,6 +100,12 @@ rules:
   - match: "rm -rf /*"
     action: deny
     reason: "Recursive delete from root is blocked."
+  # GNU rm refuses `rm -rf /` on its own; --no-preserve-root is the one
+  # spelling it obeys. The rule above is named for the command everybody
+  # quotes, this one is named for the command that actually works.
+  - match: "*--no-preserve-root*"
+    action: deny
+    reason: "--no-preserve-root is the only spelling `rm` obeys at `/`. Blocked."
   # Broad recursive-force deletes (any target), Unix + PowerShell + cmd
   # forms. DENY by default: with auto-approving agent UIs, `ask` silently
   # degrades to `allow`. Relax deliberately, per project, if you need to.
@@ -112,11 +190,18 @@ rules:
     action: allow
   - match: "git commit*"
     action: allow
-  - match: "ls*"
+  # A prefix without its trailing space is a prefix, not a command: `ls*`
+  # also matched `lsof` and `lsblk`, `grep*` also matched `grepdiff`.
+  # `cat *` and `echo *` below always had this right. Bare `ls` needs its own
+  # rule because `ls *` requires the space; bare `cat`/`grep` just read stdin,
+  # so they stay on the default.
+  - match: "ls"
+    action: allow
+  - match: "ls *"
     action: allow
   - match: "cat *"
     action: allow
-  - match: "grep*"
+  - match: "grep *"
     action: allow
   - match: "echo *"
     action: allow
@@ -162,6 +247,25 @@ pub fn run(
     } else {
         fs::write(&policy_path, STARTER_POLICY)?;
         println!("✓ wrote .termaxa/policy.yaml (starter policy)");
+    }
+
+    // --- record the policy fingerprint ---
+    // Runs whether we wrote the policy or found one: `termaxa init` is also
+    // how you say "this is the policy I mean" after editing it. The baseline
+    // goes in the state dir under $TERMAXA_HOME, not in `.termaxa/` — a
+    // baseline inside the directory it protects is erased by the same clobber
+    // it exists to catch.
+    //
+    // `resolve_readonly` on purpose: it locates the state dir without creating
+    // `logs/`, `backups/` or triggering the legacy state migration. Failure
+    // here is reported, not fatal — a missing fingerprint costs you a
+    // diagnostic, not the gate.
+    match crate::paths::resolve_readonly(dir)
+        .and_then(|p| record_fingerprint(&p.state_dir, &policy_path))
+    {
+        Ok(Some(short)) => println!("✓ recorded policy fingerprint {}", short),
+        Ok(None) => {}
+        Err(e) => println!("! could not record policy fingerprint: {}", e),
     }
 
     // --- detect agent harnesses ---
@@ -276,6 +380,20 @@ pub fn run(
 
     println!("\nDone. Try:  termaxa check \"git push --force origin main\"");
     Ok(())
+}
+
+/// Hash the policy and store the baseline in the project's state dir.
+/// Returns the short form for display, or `None` if the policy could not be
+/// read (which `doctor` will report on its own terms).
+///
+/// Takes the state dir rather than resolving it, so the test does not have to
+/// go through `$TERMAXA_HOME`.
+fn record_fingerprint(state_dir: &Path, policy_path: &Path) -> Result<Option<String>> {
+    let Some(hash) = crate::fingerprint::of_file(policy_path) else {
+        return Ok(None);
+    };
+    crate::fingerprint::record(state_dir, &hash)?;
+    Ok(Some(crate::fingerprint::short(&hash)))
 }
 
 fn install_claude_hook(dir: &Path) -> Result<()> {
@@ -405,23 +523,67 @@ mod tests {
 
     /// Schipper review, finding 3: order is load-bearing, so assert the shape
     /// rather than trusting a comment to hold.
+    ///
+    /// The shape is not "every deny precedes every allow". First-match-wins
+    /// exists so an exception can sit above the deny it excepts, and the
+    /// review-workflow allows do exactly that. What must never happen again is
+    /// a BROAD allow above a deny — `git branch*` above `*git branch -D*` was
+    /// the v0.14.1 bug. So an allow that sits above a deny has to be anchored
+    /// at the start of the command AND scoped to the path it is excepting;
+    /// anything looser can swallow the deny below it.
     #[test]
     fn hard_stops_are_reachable_before_the_read_only_allows() {
         let p: crate::policy::Policy = serde_yaml::from_str(STARTER_POLICY).unwrap();
-        let first_allow = p
-            .rules
-            .iter()
-            .position(|r| r.action == crate::policy::Action::Allow)
-            .expect("starter policy has allow rules");
         let last_deny = p
             .rules
             .iter()
             .rposition(|r| r.action == crate::policy::Action::Deny)
             .expect("starter policy has deny rules");
+        for (i, r) in p.rules.iter().enumerate().take(last_deny) {
+            if r.action != crate::policy::Action::Allow {
+                continue;
+            }
+            assert!(
+                !r.r#match.starts_with('*') && r.r#match.contains(".termaxa"),
+                "rule {i} `{}` is an unanchored allow sitting above a deny — \
+                 it can shadow the rule below it and can never be audited by \
+                 reading the denies alone",
+                r.r#match
+            );
+        }
+    }
+
+    #[test]
+    fn init_records_a_baseline_the_policy_directory_cannot_erase() {
+        let dir = std::env::temp_dir().join(format!("tmx-init-fp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let project = dir.join("proj");
+        let state = dir.join("home").join("projects").join("proj-abc12345");
+        fs::create_dir_all(project.join(".termaxa")).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let policy = project.join(".termaxa").join("policy.yaml");
+        fs::write(&policy, STARTER_POLICY).unwrap();
+
+        let short = record_fingerprint(&state, &policy)
+            .unwrap()
+            .expect("a readable policy must fingerprint");
+        assert_eq!(short.len(), 12);
+
+        // The baseline lives outside the directory it protects: `rm -rf
+        // .termaxa/` must not take the evidence with it.
+        let baseline = crate::fingerprint::baseline_file(&state);
+        assert!(baseline.is_file());
         assert!(
-            last_deny < first_allow,
-            "a deny rule sits below an allow prefix and can never be reached"
+            !baseline.starts_with(&project),
+            "baseline must not live in the project: {}",
+            baseline.display()
         );
+
+        // Re-running init on an unchanged policy records the same hash.
+        let again = record_fingerprint(&state, &policy).unwrap().unwrap();
+        assert_eq!(short, again);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

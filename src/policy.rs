@@ -329,4 +329,176 @@ rules:
             Action::Deny
         );
     }
+
+    #[test]
+    fn the_starter_policy_defends_its_own_configuration() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+
+        // The command from the review: `echo *` sat below the denies and
+        // allowed this outright, and everything after it was judged by a
+        // policy the agent had written.
+        let d = p.evaluate_command("echo 'default: allow' > .termaxa/policy.yaml");
+        assert_eq!(d.action, Action::Deny);
+        assert_eq!(d.matched_rule.as_deref(), Some("*.termaxa*"));
+
+        for cmd in [
+            "cat /tmp/mine.yaml > .termaxa/policy.yaml",
+            "rm -f .termaxa/policy.yaml",
+            "sed -i 's/deny/allow/g' .termaxa/policy.yaml",
+            "mv /tmp/mine.yaml .termaxa/policy.yaml",
+            "copy C:\\tmp\\mine.yaml .termaxa\\policy.yaml",
+            "echo '{}' > .claude/settings.json",
+            "rm .cursor/hooks.json",
+            "mv .codex/hooks.json /tmp/",
+            "rm .github/hooks/hooks.json",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                Action::Deny,
+                "must not be able to edit the gate: {cmd}"
+            );
+        }
+
+        // The self-defence block has to sit ABOVE the read-only allows, or
+        // first-match-wins hands it back. Prove the ordering, not just the
+        // verdict, by checking a command that both blocks match.
+        let idx_self = p
+            .rules
+            .iter()
+            .position(|r| r.r#match == "*.termaxa*")
+            .expect("self-defence rule must exist");
+        let idx_echo = p
+            .rules
+            .iter()
+            .position(|r| r.r#match == "echo *")
+            .expect("echo rule must exist");
+        assert!(
+            idx_self < idx_echo,
+            "self-defence must be reachable: it sits at {idx_self}, `echo *` at {idx_echo}"
+        );
+    }
+
+    #[test]
+    fn reviewing_the_policy_in_a_pr_still_works() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        // The README calls the policy an in-repo artifact, "reviewable in
+        // PRs". These are the commands that workflow is made of; a blanket
+        // deny on `*.termaxa*` made every one of them impossible.
+        for cmd in [
+            "git add .termaxa/policy.yaml",
+            "git diff .termaxa/policy.yaml",
+            "git diff --cached .termaxa/policy.yaml",
+            "git status .termaxa/",
+            "git log --oneline .termaxa/policy.yaml",
+            "git show HEAD:.termaxa/policy.yaml",
+            "git commit -m \"tighten the policy\" .termaxa/policy.yaml",
+            "cat .termaxa/policy.yaml",
+            "cp .termaxa/policy.yaml backup.yaml",
+            // One pattern covers both separators, same as the deny it excepts.
+            "git diff .termaxa\\policy.yaml",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                Action::Allow,
+                "the documented review workflow must not be blocked: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_review_exceptions_only_go_one_direction() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        // Every exception above the deny is a read. Anything that can put
+        // bytes INTO the policy stays denied, including the git verbs whose
+        // job is to overwrite the working tree from a ref.
+        for cmd in [
+            "git checkout .termaxa/policy.yaml",
+            "git checkout evil-branch -- .termaxa/policy.yaml",
+            "git restore .termaxa/policy.yaml",
+            "git config core.hooksPath .termaxa/evil",
+            "cp backup.yaml .termaxa/policy.yaml",
+            "cat backup.yaml > .termaxa/policy.yaml",
+            "tee .termaxa/policy.yaml",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                Action::Deny,
+                "writes into the gate's config must stay denied: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_review_exception_cannot_shadow_the_hook_config_denies() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        // A trailing `*` swallows a redirect, so `cat .termaxa*` matches
+        // `cat .termaxa/policy.yaml > .claude/settings.json` as well. At the
+        // top of the file these allows would shadow the denies that exist to
+        // stop exactly that. They sit below them instead.
+        for cmd in [
+            "cat .termaxa/policy.yaml > .claude/settings.json",
+            "git diff .termaxa/policy.yaml > .claude/settings.json",
+            "git add .termaxa/policy.yaml > .cursor/hooks.json",
+            "cp .termaxa/policy.yaml .codex/hooks.json",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                Action::Deny,
+                "an exception must not become a way through: {cmd}"
+            );
+        }
+
+        // Prove the ordering, not just the verdict.
+        let idx = |pat: &str| {
+            p.rules
+                .iter()
+                .position(|r| r.r#match == pat)
+                .unwrap_or_else(|| panic!("rule `{pat}` must exist"))
+        };
+        assert!(
+            idx("*.claude*settings*") < idx("cat .termaxa*"),
+            "the hook-config denies must outrank the review exceptions"
+        );
+        assert!(
+            idx("cat .termaxa*") < idx("*.termaxa*"),
+            "the review exceptions must outrank the deny they except"
+        );
+    }
+
+    #[test]
+    fn no_preserve_root_is_denied_by_name() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+        // GNU rm refuses a bare `rm -rf /`. This is the spelling it obeys,
+        // and it does not contain the substring `rm -rf` that the famous
+        // rule matches on.
+        assert!(!"rm --no-preserve-root -rf /".contains("rm -rf"));
+        for cmd in [
+            "rm --no-preserve-root -rf /",
+            "sudo rm --no-preserve-root -rf /",
+            "rm -r --no-preserve-root /",
+        ] {
+            assert_eq!(p.evaluate_command(cmd).action, Action::Deny, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn read_only_prefixes_do_not_swallow_neighbouring_commands() {
+        let p = Policy::builtin().expect("built-in starter policy must parse");
+
+        // Still allowed — including bare `ls`, which needs its own rule
+        // because `ls *` requires the space.
+        for cmd in ["ls", "ls -la src", "grep -rn fn src", "cat Cargo.toml"] {
+            assert_eq!(p.evaluate_command(cmd).action, Action::Allow, "{cmd}");
+        }
+
+        // Different programs that merely start with the same letters. `ls*`
+        // and `grep*` used to allow all of these.
+        for cmd in ["lsof -i :5432", "lsblk", "lsattr -R /", "grepdiff --help"] {
+            assert_ne!(
+                p.evaluate_command(cmd).action,
+                Action::Allow,
+                "a prefix is not a command: {cmd}"
+            );
+        }
+    }
 }
