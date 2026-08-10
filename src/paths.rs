@@ -287,6 +287,26 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// `TERMAXA_HOME` and the process working directory are per-PROCESS, and
+    /// cargo runs tests as threads inside one process. Three tests below set
+    /// them and then delete the trees they point at; anything resolving a path
+    /// concurrently could observe a half-deleted tree and fail with ENOENT
+    /// mid-`create_dir_all`.
+    ///
+    /// This surfaced as a macOS-only CI failure of
+    /// `resolve_from_uses_given_root_not_process_cwd` after an unrelated PR
+    /// added tests and changed the scheduling. It was never a macOS bug and
+    /// never that test's bug — it was a race that had been latent since these
+    /// tests were written.
+    static GLOBAL_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the lock, tolerating poisoning: if another test panicked while
+    /// holding it, every later test would fail with `PoisonError` and hide
+    /// the real failure.
+    fn lock_global_env() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn hash_key_stable_across_path_representations() {
         // The exact Windows/Cursor mismatch: backslash+uppercase vs slash+lowercase.
@@ -299,6 +319,7 @@ mod tests {
     #[test]
     fn resolve_from_uses_given_root_not_process_cwd() {
         use std::fs;
+        let _guard = lock_global_env();
         // Build a temp project with a policy, in a dir that is NOT the process cwd.
         let base = std::env::temp_dir().join(format!("tmx-cwdtest-{}", std::process::id()));
         let proj = base.join("proj");
@@ -308,6 +329,9 @@ mod tests {
             "version: 1\ndefault: ask\nrules: []\n",
         )
         .unwrap();
+        // Own the state dir rather than inheriting whatever another test left
+        // in TERMAXA_HOME — that dependency is what made this fail.
+        std::env::set_var("TERMAXA_HOME", base.join("home"));
 
         // Resolve FROM the project dir explicitly (simulating payload.cwd),
         // while the actual process cwd is elsewhere.
@@ -357,6 +381,7 @@ mod tests {
         // Simulate the agent spawning us from somewhere unrelated:
         let elsewhere = tmp.join("elsewhere");
         fs::create_dir_all(&elsewhere).unwrap();
+        let original_cwd = std::env::current_dir().ok();
         std::env::set_current_dir(&elsewhere).unwrap();
 
         // resolve() (process cwd = elsewhere) must FAIL to find the policy...
@@ -372,11 +397,17 @@ mod tests {
         );
         assert_eq!(r.unwrap().policy_file(), aegis.join("policy.yaml"));
 
+        // Restore the cwd BEFORE deleting the tree it points into. Leaving the
+        // process sitting in a deleted directory breaks unrelated tests.
+        if let Some(cwd) = original_cwd {
+            let _ = std::env::set_current_dir(cwd);
+        }
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn resolve_readonly_creates_nothing() {
+        let _guard = lock_global_env();
         // A diagnostic must not manufacture the state it reports on.
         // `termaxa doctor` runs on projects that have never executed anything;
         // if resolving created logs/ and backups/, the report would describe
