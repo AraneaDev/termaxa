@@ -2,6 +2,92 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
+## v0.14.2 — the preview no longer runs anything on a denied command
+
+Second review round from **Tim Schipper** ([@AraneaDev](https://github.com/AraneaDev)), who this time stopped reviewing and started attacking: 22 commands against the v0.14.1 starter policy, each destructive or gate-disabling. His first PR to this repo is in this release.
+
+### Fixed
+
+- **A denied command could still cause a subprocess.** (Security advisory
+  pending; see also GHSA-gxg4-5fmj-534m, which was the first instance of this
+  same structure.) `hook::run` generates the preview before returning the
+  decision, so a DENIED `terraform destroy` still ran `terraform plan -destroy`
+  in the agent's working directory.
+
+  `terraform plan` re-evaluates `data` sources against existing state, and the
+  `external` data source executes an arbitrary program named in the user's
+  configuration. Confirmed end-to-end against Terraform 1.9.8: a command
+  Termaxa denied executed the program, and no longer does.
+
+  v0.14.1 fixed what the Postgres preview did with the arguments it was handed.
+  That was the instance; this is the class.
+
+  The fix is not to skip the preview on deny. The denial message is more useful
+  with it, and the delete preview never spawned anything in the first place.
+  "May this execute?" is now an argument to `preview::generate`, decided by the
+  caller that already knows the verdict. A denied `DROP TABLE` still reports
+  `| DROP users` — it just no longer connects to the database it was blocked
+  from. `git push` previews, being entirely subprocess-derived, are absent on a
+  deny.
+
+- **The gate now defends its own configuration** (#16, by Tim Schipper). The
+  starter policy had no rule about `.termaxa/` or the agent hook configs, so
+  `echo 'default: allow' > .termaxa/policy.yaml` matched `echo *` and was
+  allowed — one line replacing the policy with a permissive one. A cleanup
+  script hits this without any intent to evade. Adds a self-defence block, with
+  read-only exceptions narrow enough to keep the documented "policy is in-repo,
+  reviewable in PRs" workflow: `git diff`/`add`/`log`/`show`, `cat`, and `cp`
+  anchored so the copy only goes *out* of the directory.
+
+- **Policy fingerprinting** (#16). `termaxa init` records a SHA-256 of the
+  policy; `termaxa doctor` reports it and says whether it changed. What cannot
+  be blocked can at least be noticed — an agent's file-writing tools never
+  reach the hook, which registers with a `Bash` matcher. The baseline lives in
+  the state dir, not in `.termaxa/`, because a baseline inside the directory it
+  protects is erased by the same clobber it exists to catch.
+
+- **`ls*` and `grep*` were prefixes, not commands** (#16). `ls*` also matched
+  `lsof`, `lsblk` and `lsattr`; `grep*` matched `grepdiff`. Now `ls`, `ls *`
+  and `grep *`, matching what `cat *` and `echo *` already did.
+
+- **`rm --no-preserve-root -rf /`** (#16). The `rm -rf /*` rule is named for the
+  command everyone quotes, but GNU `rm` refuses that one — `--no-preserve-root`
+  is the spelling it obeys, and it does not contain the substring `rm -rf`.
+
+- **`git push origin +main`** (#16). A leading `+` on a refspec is a force push
+  and has no other meaning. The classifier now counts it, so the breaker sees
+  it.
+
+- **A latent race in the `paths` tests** (#17, by Tim Schipper). `TERMAXA_HOME`
+  and the process cwd are per-process while cargo runs tests as threads in one
+  process; three tests mutated them and deleted the trees they pointed at. It
+  surfaced as a macOS-only CI failure after #16 changed the scheduling, and had
+  been latent since those tests were written. The quieter half: the tests had
+  been resolving into the developer's real `~/.termaxa` on every green run.
+
+- **Test isolation is now a helper rather than a discipline** (#18, by Tim
+  Schipper). `TestEnv` takes the lock, points `TERMAXA_HOME` at a tree it alone
+  owns, and on drop restores the cwd and the variable, removes the tree, and
+  **fails the test if state landed anywhere else**. That last check is the
+  point: `resolve_from_uses_explicit_dir_not_process_cwd` asserts nothing about
+  home and would have passed while polluting — the guard catches it alone.
+  Verified by breaking both claims rather than reading them.
+
+### Documentation
+
+- SECURITY.md gains the self-defence limitation, stated plainly: these rules are
+  a string filter over the command line, not a guard on a path. `git commit -am`
+  commits a modified policy without naming the file.
+
+### Not fixed, deliberately
+
+Matching on the tokenized form (which would also recover case-sensitivity for
+`-D` vs `-d`), and carrying the redirect target out of `split_segments`. Both
+retire classes rather than instances and are the v0.15 work; the second is #14,
+with #12 as the other half of the same category. Wiring the intent classifier
+into the allow→ask ladder is a behaviour change across every policy and is
+filed with them.
+
 ## v0.14.1 — security patch: the preview could execute the command
 
 An unsolicited end-to-end code review by **Tim Schipper** ([@AraneaDev](https://github.com/AraneaDev)) — who compiled Termaxa's own functions into a standalone harness rather than arguing from a reading — found ten issues in v0.14.0. This release fixes the ones that fail in the quiet direction. **Anyone using the Postgres preview against a real database should upgrade.**
