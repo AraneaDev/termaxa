@@ -8,9 +8,7 @@ Second review round from **Tim Schipper** ([@AraneaDev](https://github.com/Arane
 
 ### Fixed
 
-- **A denied command could still cause a subprocess.** (Security advisory
-  pending; see also GHSA-gxg4-5fmj-534m, which was the first instance of this
-  same structure.) `hook::run` generates the preview before returning the
+- **A denied command could still cause a subprocess.** (GHSA-m854-p747-v3gw; see also GHSA-gxg4-5fmj-534m, which was the first instance of this same structure.) `hook::run` generates the preview before returning the
   decision, so a DENIED `terraform destroy` still ran `terraform plan -destroy`
   in the agent's working directory.
 
