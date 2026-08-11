@@ -31,6 +31,25 @@ That boundary is not a hedge, and it has a measurable price. In August 2026, Tim
 
 Read that as a statement about the design rather than about the implementation. Policy matching is substring-based, so every one of those 22 is closable with a rule, and the next 22 spellings will need 22 more. A rule-per-spelling gate cannot win an adversarial game. It is not trying to.
 
+What that boundary looks like in practice, from a Claude Code auto-mode session
+on 2026-08-11 (audit log, timestamps unedited):
+
+```
+19:12:26 ✗  rm -rf ./notes.txt && ls -la — segment 1/2 — Recursive force delete blocked
+19:12:31 ?  rm ./notes.txt && ls -la     — segment 1/2 — no rule matched; default `ask`
+19:14:42 ✓  post-execution receipt
+```
+
+The agent was told no, reasoned five seconds later that dropping `-rf` made the
+command equivalent, and retried. It was not evading anything — it was being
+helpful. The `deny` held, the workaround met an `ask` that forced a prompt even
+under auto mode, the compound was split so `&& ls -la` did not mask the delete,
+and a backup was taken before the prompt was answered. `termaxa rollback`
+restored the file.
+
+That is the erring-agent case the tool is built for, and it is also why `deny`
+and insurance carry the weight rather than `ask`.
+
 **The decision rule this gives us**, and the one we apply to every bypass report:
 
 > Would a cooperative agent, making an ordinary mistake, hit this?
@@ -54,7 +73,20 @@ We state this because it would be very convenient to call every bypass "out of s
 - **Backups have boundaries.** `pg_dump`/`psql` and `git` must be on PATH. `rm` insurance resolves the command head, so `/bin/rm` and `/usr/bin/rm` are covered; shell aliases and variable-expanded command names are not. (Note that the *intent classifier* is stricter than the backup engine here — it keys on the raw first token, so `sudo rm`, `/bin/rm` and `env rm` are insured but not classified, and therefore do not advance the circuit breaker's counter.) Compound commands are insured for the first insurable segment only. Remote Terraform state is not backed up (its backend versions it). There is no backup retention/pruning yet.
 - **Policy matching is case-insensitive.** This is usually what you want — `*rm -rf*` catches `rm -RF`, and `*drop table*` catches `DROP TABLE`. The cost is that a rule cannot distinguish `-D` from `-d`, so flag pairs whose case carries the meaning (`git branch -d/-D`, `git checkout -b/-B`, `git branch -m/-M`) collapse into one rule, and the action is chosen for the safer of the two.
 - **Policy is only as good as you write it.** The starter policy is a sensible default, not a guarantee. Review it. `default: ask` fails closed, which is the safe direction, but an over-broad `allow` rule can still wave through something you'd rather catch. Note that ordering is load-bearing: matching is first-wins, so a broad allow prefix placed above a deny rule makes that deny unreachable. The starter policy puts hard stops first for this reason.
-- **`ask` degrades to `allow` under auto-approving agent UIs.** Several agent harnesses can be configured to answer prompts automatically. Where that is on, treat every `ask` in your policy as an `allow` — which is why the starter policy denies broad recursive deletes outright rather than asking.
+- **`ask` may or may not reach a human, depending on the harness.** This entry
+  used to say flatly that `ask` degrades to `allow` under auto-approving UIs.
+  Tested against Claude Code auto mode (the default since August 2026) that is
+  **not** true: a hook's `ask` forces the prompt, because PreToolUse hooks are
+  evaluated before the permission classifier, and `deny` blocks outright.
+  Observed, not inferred — session log below.
+
+  It remains true wherever the harness answers prompts without consulting a
+  hook, and for any harness with no hook mechanism at all. Treat it as a
+  property of your harness rather than a property of Termaxa, and check yours:
+  a `deny` that holds and an `ask` that prompts are both easy to verify in five
+  minutes. The starter policy still denies broad recursive deletes outright
+  rather than asking, because that is the assumption that survives being wrong
+  about the harness.
 - **Fail-open on plumbing.** If the hook receives malformed input, Termaxa steps aside rather than breaking your session. This is deliberate (a gate that bricks sessions gets uninstalled) but means a sufficiently broken invocation is ungoverned.
 - **The circuit breaker is per-session, and the session id can rotate.** The breaker counts repeated destructive intent within one agent session and escalates further variants to `deny`. If the harness rotates its session id mid-run (observed with both Claude Code and Cursor), the counter resets. It classifies command *intent* (file-delete, db-destroy, git-force, infra-destroy), including deletes hidden behind `find -exec`, `xargs`, and `unlink` — but it is a speed bump against retry-flailing, not a guaranteed cap, and it only sees commands that reach the shell hook. It also only escalates `ask` to `deny`: a command the policy already allows cannot be rescued by correct classification.
 - **Hook dialects can drift.** Agents change their hook APIs between versions —
