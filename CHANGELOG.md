@@ -4,6 +4,61 @@ All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https:
 
 ## Unreleased
 
+### Changed
+
+- **Stop treating commands as strings.** Four of the five changes in this
+  release are the same bug: matching text where we mean to match a thing.
+  Policy rules now evaluate every command in three readings — as written,
+  tokenized (quotes gone), and tokenized case-preserved — and the most severe
+  verdict governs, so `"rm" -rf /` and `rm -r''f /` can no longer slip a deny
+  by quoting. Case sensitivity is an explicit `case_sensitive: true` rule
+  field, never inferred from spelling; the starter policy opts in exactly
+  once, on `git branch*-D*`, which can finally mean `-D`. Reported by
+  **Tim Schipper**.
+
+  Stated behavior change: a quoted spelling of an excepted command
+  (`"cat" .termaxa/policy.yaml`) now fails closed where the plain spelling
+  still allows — the same call the v0.14.2 self-defence rules made for
+  unlisted reads.
+
+- **Destruction by overwrite, the redirect half.** `>` truncates, and until
+  now the operator was lexed and discarded: `cat /dev/null > .env` matched
+  the read-only `cat *` rule and was allowed. Truncating redirects are now
+  extracted (sinks like `/dev/null` excluded), classified `file-overwrite`,
+  insured by copying the target aside before execution, and denied outright
+  for paths whose loss is not recoverable from the repo (`.env`, `/etc/`,
+  SSH keys). The overwrite denies sit above the `.termaxa` read exceptions,
+  which would otherwise launder them. The breaker counts an overwrite only
+  when a rule objected, so redirected build logs never accumulate toward a
+  trip. **#12 stays open**: `cp`/`mv`/`tee`/`dd` destinations are not
+  covered, so the incident that opened it is not closed by this release.
+
+- **`doctor` proves the hook fires instead of grepping for its name.** The
+  old check was a substring search over settings.json; a hook whose path was
+  mangled at exec failed non-blocking and doctor said "configured" in green
+  through two ungated sessions (observed on Windows, 2026-08-13). `doctor`
+  now invokes the registered command through the shell with a synthetic
+  must-deny payload and a two-second timeout, and reports configured-and-live,
+  registered-but-not-firing, or absent. The probe runs only binaries named
+  termaxa (settings files arrive in cloned repos), writes no state — proven
+  against the real binary, with a control — and a live hook that does not
+  deny the probe is flagged rather than failed. Live means "answered when
+  doctor invoked it"; pair it with the log-recency check for the
+  harness-side failures the probe cannot see.
+
+- **Decline rather than allow.** Where the policy merely fails to object —
+  the default path, not an explicit `allow` rule — the hook now emits no
+  decision instead of asserting an approval it never formed. Gated to the
+  dialects whose contract documents that silence means no opinion (Claude
+  Code, Codex); Cursor and Copilot keep receiving explicit answers until a
+  live capture says otherwise. Suggested by **Tim Schipper**.
+
+- **The recoverability invariant.** A destructive rule may be `ask` only if
+  something can undo it; `ask` under an auto-approving UI is `allow`. Every
+  `ask` in the starter policy now carries a documented recovery path,
+  enforced by a test, and the three that had none — `docker system prune`,
+  `dd` onto a raw device, `mkfs` — are denies.
+
 ### Added
 
 - **A write-tool matcher, so a shell deny cannot be routed around one tool over.**

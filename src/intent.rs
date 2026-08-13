@@ -53,6 +53,9 @@ pub enum Intent {
     GitDestructive,
     /// Infrastructure teardown: terraform/tofu destroy, kubectl delete.
     InfraDestroy,
+    /// Destruction by OVERWRITE rather than deletion: `cmd > existing-file`.
+    /// Nothing is removed; the contents are replaced. v0.15 — see #14.
+    FileOverwrite,
 }
 
 impl Intent {
@@ -62,6 +65,7 @@ impl Intent {
             Intent::DbDestroy => "db-destroy",
             Intent::GitDestructive => "git-destructive",
             Intent::InfraDestroy => "infra-destroy",
+            Intent::FileOverwrite => "file-overwrite",
         }
     }
 
@@ -72,6 +76,8 @@ impl Intent {
             Intent::DbDestroy => 4,
             Intent::InfraDestroy => 3,
             Intent::FileDelete => 2,
+            // Same destructive weight as a delete: the file is gone either way.
+            Intent::FileOverwrite => 2,
             Intent::GitDestructive => 1,
         }
     }
@@ -92,12 +98,39 @@ pub fn classify_command(command: &str) -> Option<Intent> {
         .max_by_key(|i| i.rank())
 }
 
+/// A truncating redirect destroys whatever was at the target. Checked before
+/// command-name classification, because the destructive part is the operator
+/// rather than the program: `cat`, `echo` and `ls` are all read-only commands
+/// right up until a `>` is attached to them.
+fn overwrite_intent(segment: &str) -> Option<Intent> {
+    crate::shell::redirect_targets(segment)
+        .iter()
+        .any(|o| o.truncates)
+        .then_some(Intent::FileOverwrite)
+}
+
 /// Classify one shell segment. Returns `None` for benign commands.
 ///
 /// Scope is deliberately limited to *commands*: `python -c "shutil.rmtree(...)"`
 /// will not classify. That is the cooperative-gate boundary SECURITY.md
 /// documents; the breaker is a speed bump for syntax variation, not a sandbox.
-pub fn classify_segment(segment: &str) -> Option<Intent> {
+fn classify_segment(segment: &str) -> Option<Intent> {
+    // Both classifications, highest rank wins, the command-name one on ties.
+    // NOT an early return on the overwrite: `psql -c "DROP TABLE u" > out.sql`
+    // is db-destroy (rank 4) that also writes a file, and the first draft
+    // demoted it to file-overwrite (rank 2) — every destructive command that
+    // logs its output lost the rank the breaker keys on.
+    let base = classify_segment_named(segment);
+    let ow = overwrite_intent(segment);
+    match (base, ow) {
+        (Some(b), Some(o)) => Some(if b.rank() >= o.rank() { b } else { o }),
+        (b, o) => b.or(o),
+    }
+}
+
+/// Classification by command name and flags — everything except the
+/// overwrite operator, which `classify_segment` merges in above.
+fn classify_segment_named(segment: &str) -> Option<Intent> {
     let toks = tokens(segment);
     if toks.is_empty() {
         return None;
@@ -274,6 +307,13 @@ pub fn recent_intent_count(
     entries
         .iter()
         .filter(|e| e["intent"].as_str() == Some(intent.label()))
+        // A file-overwrite counts as destructive pressure only when a RULE
+        // objected. A default-ask on `cargo build > build.log` is the policy
+        // having no opinion — the decline-not-allow principle applied to the
+        // breaker. Without this, the third redirected build log of any real
+        // session was DENIED (threshold 2), because agents redirect
+        // constantly and every redirect accumulated toward a trip.
+        .filter(|e| intent != Intent::FileOverwrite || e["matched_rule"].as_str().is_some())
         .filter(|e| match e["decision"].as_str() {
             Some("deny") => true,
             Some("ask") => !approved.contains(e["command"].as_str().unwrap_or("")),
@@ -359,7 +399,7 @@ pub fn maybe_trip(
 // Private helpers: quote-aware tokenizer + segment splitter
 // ---------------------------------------------------------------------------
 
-fn tokens(segment: &str) -> Vec<String> {
+pub fn tokens(segment: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -408,6 +448,133 @@ fn tokens(segment: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::testutil::TempTree;
+
+    /// #14 / #12. Destruction by overwrite: nothing is deleted, the contents
+    /// are replaced. `cat`, `echo` and `ls` are read-only commands right up
+    /// until a `>` is attached, so this classifies on the operator.
+    #[test]
+    fn a_truncating_redirect_is_a_destructive_intent() {
+        for cmd in [
+            "cat /dev/null > .env",
+            "echo '' > config.json",
+            "ls -la > /etc/hosts",
+            "grep -r . / > /tmp/exfil",
+        ] {
+            assert_eq!(
+                classify_command(cmd),
+                Some(Intent::FileOverwrite),
+                "{cmd} destroys a file by writing over it"
+            );
+        }
+    }
+
+    /// Appending does not destroy, descriptor plumbing names no file, and a
+    /// SINK is a discard device — truncating /dev/null destroys nothing.
+    /// Classifying any of these fires on every build command in existence.
+    #[test]
+    fn appends_descriptors_and_sinks_are_not_destructive() {
+        for cmd in [
+            "echo entry >> app.log",
+            "make 2>&1",
+            "cmd >&2",
+            "npm run build &> build.log",
+            "cargo test > /dev/null",
+            "cmd 2> /dev/null",
+            "make >/dev/null 2>&1",
+        ] {
+            assert_eq!(classify_command(cmd), None, "{cmd} must not classify");
+        }
+    }
+
+    /// A redirect never DEMOTES a higher-ranked intent. The first draft
+    /// early-returned on the overwrite check, so a destructive command that
+    /// also logged its output lost the rank the breaker keys on.
+    #[test]
+    fn a_redirect_never_downgrades_a_higher_intent() {
+        assert_eq!(
+            classify_command("psql -c \"DROP TABLE users\" > out.sql"),
+            Some(Intent::DbDestroy),
+            "db-destroy (4) must not demote to file-overwrite (2)"
+        );
+        assert_eq!(
+            classify_command("terraform destroy -auto-approve > tf.log"),
+            Some(Intent::InfraDestroy)
+        );
+        assert_eq!(
+            classify_command("rm -rf build > rm.log"),
+            Some(Intent::FileDelete),
+            "equal ranks: the command-name classification wins the tie"
+        );
+    }
+
+    /// The breaker half of decline-not-allow: a file-overwrite adds pressure
+    /// only when a RULE objected. Two default-ask build logs (matched_rule
+    /// null) must not cause the third to trip; three gated attempts must.
+    #[test]
+    fn only_gated_overwrites_accumulate_breaker_pressure() {
+        let tmp = TempTree::new("intent-ow");
+        let ungated = write_log(
+            &tmp,
+            &[
+                entry_with_rule(
+                    "s1",
+                    "ask",
+                    "file-overwrite",
+                    "cargo build > build.log",
+                    None,
+                ),
+                entry_with_rule("s1", "ask", "file-overwrite", "cargo test > test.log", None),
+            ],
+        );
+        assert_eq!(
+            recent_intent_count(&ungated, "s1", Intent::FileOverwrite, 64 * 1024),
+            0,
+            "default-ask overwrites are the policy having no opinion"
+        );
+
+        let tmp2 = TempTree::new("intent-ow2");
+        let gated = write_log(
+            &tmp2,
+            &[
+                entry_with_rule(
+                    "s1",
+                    "deny",
+                    "file-overwrite",
+                    "cat /dev/null > .env",
+                    Some("*> .env*"),
+                ),
+                entry_with_rule(
+                    "s1",
+                    "deny",
+                    "file-overwrite",
+                    "echo '' > .env",
+                    Some("*> .env*"),
+                ),
+                entry_with_rule(
+                    "s1",
+                    "deny",
+                    "file-overwrite",
+                    "true > .env",
+                    Some("*> .env*"),
+                ),
+            ],
+        );
+        assert_eq!(
+            recent_intent_count(&gated, "s1", Intent::FileOverwrite, 64 * 1024),
+            3,
+            "gated overwrite attempts count in full"
+        );
+    }
+
+    /// A compound where the overwrite is not the first segment. The most
+    /// severe intent governs, as it does for every other class.
+    #[test]
+    fn an_overwrite_is_found_in_a_compound() {
+        assert_eq!(
+            classify_command("git status && echo x > .env"),
+            Some(Intent::FileOverwrite)
+        );
+    }
 
     // --- classification ---
 
@@ -590,6 +757,20 @@ mod tests {
             body.push_str(&format!("{}\n", l));
         }
         tmp.file("audit.jsonl", &body)
+    }
+
+    fn entry_with_rule(
+        session: &str,
+        decision: &str,
+        intent: &str,
+        command: &str,
+        matched_rule: Option<&str>,
+    ) -> serde_json::Value {
+        let mut e = entry(session, decision, intent, command);
+        if let Some(r) = matched_rule {
+            e["matched_rule"] = serde_json::json!(r);
+        }
+        e
     }
 
     fn entry(session: &str, decision: &str, intent: &str, command: &str) -> serde_json::Value {

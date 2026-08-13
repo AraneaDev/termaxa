@@ -109,6 +109,8 @@ pub fn take(termaxa_dir: &Path, command: &str) -> Result<Option<BackupRecord>> {
         backup_files(termaxa_dir, &id, &ts, command, &paths)?
     } else if let Some(state) = tf_state_target(&tokens) {
         backup_files(termaxa_dir, &id, &ts, command, &[state])?
+    } else if let Some(paths) = overwrite_targets(command) {
+        backup_files(termaxa_dir, &id, &ts, command, &paths)?
     } else {
         return Ok(None);
     };
@@ -301,6 +303,30 @@ fn backup_pg(
 /// Everything here routes through `crate::delete` — the same resolution and
 /// the same per-shell flag rules the preview uses — so the two engines cannot
 /// disagree about what a command targets.
+/// Files a truncating redirect is about to write over.
+///
+/// v0.15, #14. `cat /dev/null > .env` destroys a file without deleting
+/// anything, so `rm_targets` never saw it and no backup was taken. Insurance is
+/// the same mechanism as for a delete — copy aside first — because the outcome
+/// is the same: the contents are gone.
+///
+/// Only files that already EXIST are insurable. `> newfile` creates rather than
+/// destroys, and backing up a path with no contents is noise in the manifest.
+/// Appends (`>>`) are excluded upstream by `Overwrite::truncates`.
+fn overwrite_targets(command: &str) -> Option<Vec<PathBuf>> {
+    let paths: Vec<PathBuf> = crate::shell::redirect_targets(command)
+        .into_iter()
+        .filter(|o| o.truncates)
+        .map(|o| crate::delete::resolve_path(&o.target))
+        .filter(|p| p.is_file())
+        .collect();
+    if paths.is_empty() {
+        None
+    } else {
+        Some(paths)
+    }
+}
+
 fn rm_targets(tokens: &[String]) -> Option<Vec<PathBuf>> {
     let head = crate::delete::command_head(tokens.first()?);
     if !crate::delete::is_delete_command(&head) {
@@ -488,6 +514,42 @@ fn git_out(args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// #14. The insurance half: an overwrite that is not denied must still be
+    /// recoverable, because "agents write files constantly" is exactly why the
+    /// gate cannot ask about every one.
+    #[test]
+    fn an_existing_file_about_to_be_overwritten_is_insurable() {
+        let tmp = crate::testutil::TempTree::new("bk-ow");
+        let dir = tmp.path();
+        let target = dir.join("config.json");
+        std::fs::write(&target, "original contents").unwrap();
+
+        let cmd = format!("echo {{}} > {}", target.display());
+        let found = overwrite_targets(&cmd).expect("an existing file must be insurable");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with("config.json"));
+    }
+
+    /// Creating a file destroys nothing, and appending destroys nothing.
+    /// Backing either up is noise in the manifest.
+    #[test]
+    fn creating_or_appending_is_not_insurable() {
+        let tmp = crate::testutil::TempTree::new("bk-ow2");
+        let dir = tmp.path();
+        let existing = dir.join("app.log");
+        std::fs::write(&existing, "log").unwrap();
+
+        assert!(
+            overwrite_targets(&format!("echo x > {}", dir.join("brand-new.txt").display()))
+                .is_none(),
+            "> onto a path that does not exist creates rather than destroys"
+        );
+        assert!(
+            overwrite_targets(&format!("echo x >> {}", existing.display())).is_none(),
+            ">> appends"
+        );
+    }
+
     use crate::testutil::TempTree;
 
     /// A real temp directory containing one file. The guard is returned with

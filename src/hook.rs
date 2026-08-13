@@ -371,6 +371,22 @@ fn gate_file_write(w: &FileWrite) {
     std::process::exit(2);
 }
 
+/// Should this decision be withheld rather than emitted?
+///
+/// Only a default-allow — allow with no rule behind it — and only for the
+/// dialect whose contract documents that no output means no opinion. Claude
+/// Code documents exactly that; Codex claims the same contract. Cursor and
+/// Copilot do not, and the last time this project assumed Cursor's hook
+/// contract it shipped four releases of silent ungating (3.11). They keep
+/// emitting until a TERMAXA_HOOK_DEBUG capture on a live session says
+/// silence is safe. See the comment at the call site in `run` for why the
+/// default-allow goes silent at all.
+fn is_silent(dialect: Dialect, decision: &crate::policy::Decision) -> bool {
+    matches!(dialect, Dialect::ClaudeCode | Dialect::Codex)
+        && decision.action == crate::policy::Action::Allow
+        && decision.matched_rule.is_none()
+}
+
 /// Decision -> the JSON each agent expects on stdout.
 pub fn render_response(dialect: Dialect, permission: &str, reason: &str) -> String {
     match dialect {
@@ -583,7 +599,17 @@ pub fn run() -> Result<()> {
     // escalates ask -> deny. Only ASK is ever touched — explicit allow/deny
     // rules are deliberate user policy. Runs BEFORE the backup step so a
     // breaker-denied command never triggers insurance (nothing will run).
-    if decision.action == Action::Ask {
+    // A DEFAULT-ask file-overwrite must neither accumulate pressure (see
+    // recent_intent_count) nor BE the tripping command: three denied `.env`
+    // attempts must not turn the next `cargo build > build.log` into a deny.
+    // The policy had no opinion on that build log — decline-not-allow,
+    // applied to the breaker.
+    let ungated_overwrite = decision.matched_rule.is_none()
+        && matches!(
+            crate::intent::classify_command(&command),
+            Some(crate::intent::Intent::FileOverwrite)
+        );
+    if decision.action == Action::Ask && !ungated_overwrite {
         let log_path = paths.state_dir.join("logs").join("audit.jsonl");
         if let Some((_intent, _prior, reason)) = crate::intent::maybe_trip(
             &paths.policy_file(),
@@ -611,35 +637,73 @@ pub fn run() -> Result<()> {
 
     // Insure before allowing: PreToolUse runs before execution, so a backup
     // taken here is guaranteed to predate the command. Never for deny.
+    //
+    // LIVENESS PROBE (v0.15). `doctor` invokes the hook exactly as the agent
+    // does, to prove it can actually run — see `doctor::hook_live`. A probe must
+    // be inert: no backup, no audit entry, no state. It still evaluates policy
+    // and answers, because answering is the thing being tested.
+    //
+    // Why this exists: `hook_configured` used to be a substring search for
+    // "termaxa hook" in settings.json. A hook whose path did not resolve at exec
+    // time failed non-blocking, the session ran ungated, and doctor reported
+    // "configured" in green. Observed on Windows 2026-08-13.
+    //
+    // The env var ALONE must not switch off backups and the audit record —
+    // for a tool whose pitch is the backup and the record, a single ambient
+    // variable that silently disables both (direnv, a doctored launch
+    // script) is a kill switch. So probe mode requires BOTH the variable and
+    // the sentinel session id, and `doctor` is the only thing that sends the
+    // sentinel. An agent command cannot set its harness's env; a leaked env
+    // var without the sentinel changes nothing.
+    let is_probe = std::env::var("TERMAXA_HOOK_PROBE").as_deref() == Ok("1")
+        && input.session.as_deref() == Some("termaxa-doctor-probe");
+
     let mut backup_id: Option<String> = None;
-    if decision.action != Action::Deny {
+    if !is_probe && decision.action != Action::Deny {
         if let Ok(Some(rec)) = crate::backup::take(&paths.state_dir, &command) {
             backup_id = Some(rec.id);
         }
     }
 
     // Audit first, decide second: even denied attempts are part of the record.
-    if let Ok(log) = AuditLog::new(&paths.state_dir) {
-        let (ts_ms, ts) = now();
-        let _ = log.append(&AuditEntry {
-            ts_ms,
-            ts,
-            source: "hook".into(),
-            command: command.clone(),
-            decision: decision.action.to_string(),
-            matched_rule: decision.matched_rule.clone(),
-            reason: decision.reason.clone(),
-            signals: signals.iter().map(|s| s.label.clone()).collect(),
-            escalated,
-            session: input.session.clone(),
-            backup: backup_id.clone(),
-            preview: preview_summary.clone(),
-            intent: intent_label.clone(),
-            approved: None,
-            exit_code: None,
-            cwd: input.cwd.clone(),
-        });
+    // Except a probe, which must leave the record exactly as it found it.
+    if !is_probe {
+        if let Ok(log) = AuditLog::new(&paths.state_dir) {
+            let (ts_ms, ts) = now();
+            let _ = log.append(&AuditEntry {
+                ts_ms,
+                ts,
+                source: "hook".into(),
+                command: command.clone(),
+                decision: decision.action.to_string(),
+                matched_rule: decision.matched_rule.clone(),
+                reason: decision.reason.clone(),
+                signals: signals.iter().map(|s| s.label.clone()).collect(),
+                escalated,
+                session: input.session.clone(),
+                backup: backup_id.clone(),
+                preview: preview_summary.clone(),
+                intent: intent_label.clone(),
+                approved: None,
+                exit_code: None,
+                cwd: input.cwd.clone(),
+            });
+        }
     }
+
+    // DECLINE RATHER THAN ALLOW (v0.15).
+    //
+    // A policy that merely fails to object is not the same as a policy that
+    // deliberately blesses a command, and until now Termaxa said "allow" for
+    // both. That is a false statement about our own confidence: for every
+    // command no rule matched, we were asserting a verdict we had not formed.
+    //
+    // So: an explicit `action: allow` rule still emits allow, because someone
+    // wrote it down on purpose. The default-allow path emits nothing and lets
+    // the harness decide for itself.
+    //
+    // Suggested by Tim Schipper.
+    let silent = is_silent(input.dialect, &decision);
 
     let permission = match decision.action {
         Action::Allow => "allow",
@@ -660,15 +724,24 @@ pub fn run() -> Result<()> {
         reason.push_str(&format!(" | backup {}", id));
     }
 
-    crate::notify::maybe_send(
-        &policy,
-        &decision.action.to_string(),
-        &command,
-        &decision.reason,
-        "hook",
-    );
+    // A probe must not page anyone: with `notify.on: [deny]` configured,
+    // every `termaxa doctor` run would otherwise post a "denied rm -rf /"
+    // webhook per detected agent.
+    if !is_probe {
+        crate::notify::maybe_send(
+            &policy,
+            &decision.action.to_string(),
+            &command,
+            &decision.reason,
+            "hook",
+        );
+    }
 
-    println!("{}", render_response(input.dialect, permission, &reason));
+    // A probe must always answer — `doctor` reads the decision to prove the hook
+    // can run at all, and silence is indistinguishable from a dead hook.
+    if !silent || is_probe {
+        println!("{}", render_response(input.dialect, permission, &reason));
+    }
 
     // Belt and suspenders: Cursor and Copilot also honor the process exit code
     // (2 = block). On Windows especially, stdout JSON delivery can be finicky,
@@ -684,6 +757,55 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.15: a policy that merely fails to object must not claim to approve.
+    /// The default-allow path emits nothing; an explicit allow rule still says
+    /// allow, because someone wrote that rule on purpose.
+    #[test]
+    fn a_default_allow_is_silence_and_an_explicit_allow_is_not() {
+        use crate::policy::{Action, Decision};
+
+        let no_opinion = Decision {
+            action: Action::Allow,
+            matched_rule: None,
+            reason: "no rule matched; policy default is `allow`".into(),
+        };
+        let deliberate = Decision {
+            action: Action::Allow,
+            matched_rule: Some("git status*".into()),
+            reason: "matched rule `git status*`".into(),
+        };
+
+        assert!(
+            is_silent(Dialect::ClaudeCode, &no_opinion),
+            "an unmatched command must not be reported as approved"
+        );
+        assert!(
+            !is_silent(Dialect::ClaudeCode, &deliberate),
+            "an explicit allow rule is a deliberate blessing and must be emitted"
+        );
+        // Cursor and Copilot keep emitting: their empty-stdout semantics are
+        // uncaptured, and Cursor has burned this project once already (3.11).
+        assert!(!is_silent(Dialect::Cursor, &no_opinion));
+        assert!(!is_silent(Dialect::Copilot, &no_opinion));
+    }
+
+    /// ask and deny always speak, whether or not a rule matched them.
+    #[test]
+    fn only_allow_can_ever_be_silent() {
+        use crate::policy::{Action, Decision};
+        for action in [Action::Ask, Action::Deny] {
+            let d = Decision {
+                action,
+                matched_rule: None,
+                reason: "default".into(),
+            };
+            assert!(
+                !is_silent(Dialect::ClaudeCode, &d),
+                "{action} must always be emitted"
+            );
+        }
+    }
 
     #[test]
     fn cursor_real_payload_uses_workspace_roots_when_cwd_empty() {

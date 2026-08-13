@@ -29,6 +29,43 @@ pub struct Rule {
     pub action: Action,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Match this rule as written instead of case-insensitively.
+    ///
+    /// EXPLICIT, defaulting to false, and never inferred from the pattern's
+    /// spelling. The first draft inferred it from the presence of an
+    /// uppercase letter, which silently made `*Remove-Item*-Recurse*`
+    /// case-sensitive and let `remove-item -recurse` walk past a deny that
+    /// has shipped since v0.11 — the release's own bug class (reading intent
+    /// out of spelling) applied to the rule text itself.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub case_sensitive: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl Rule {
+    /// Does this rule match one reading of a command?
+    ///
+    /// A rule matches case-insensitively, as it always has: `drop table`
+    /// still catches `DROP TABLE`, and an uppercase SPELLING changes nothing
+    /// (`*Remove-Item*` still catches `remove-item`). A rule that opted in
+    /// with `case_sensitive: true` is matched as written against the
+    /// case-preserved reading, so `git branch*-D*` can mean `-D` and not
+    /// `-d`. The field decides; the spelling never does.
+    pub fn matches(&self, reading: &str) -> bool {
+        if self.case_sensitive {
+            wildcard_match(&collapse(&self.r#match), reading)
+        } else {
+            wildcard_match(&normalize(&self.r#match), reading)
+        }
+    }
+}
+
+/// Collapse whitespace without touching case.
+pub fn collapse(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,25 +190,96 @@ impl Policy {
     }
 
     pub fn evaluate(&self, command: &str) -> Decision {
-        let cmd = normalize(command);
-        for rule in &self.rules {
-            if wildcard_match(&normalize(&rule.r#match), &cmd) {
-                return Decision {
-                    action: rule.action,
-                    matched_rule: Some(rule.r#match.clone()),
-                    reason: rule
-                        .reason
-                        .clone()
-                        .unwrap_or_else(|| format!("matched rule `{}`", rule.r#match)),
-                };
+        // First-match PER READING, MOST SEVERE across readings, earliest rule
+        // on ties. See `readings` for what the readings are.
+        //
+        // Not "first rule matching any reading": post-#16 the policy pattern
+        // for exceptions is an anchored allow ABOVE the deny it excepts, and
+        // under any-reading matching a quoted spelling could reach the
+        // exception through the tokenized reading while the raw reading sat
+        // on the deny below it. Severity-across-readings makes that case fail
+        // CLOSED instead: a spelling only some readings recognise as the
+        // excepted command gets the deny, loudly — the same call #16 made for
+        // unlisted reads. The cost, stated: quoted spellings of excepted
+        // commands (`"cat" .termaxa/policy.yaml`) now deny where the plain
+        // spelling still allows.
+        let views = readings(command);
+        let mut best: Option<(usize, &Rule)> = None;
+        for v in &views {
+            if let Some((idx, rule)) = self.rules.iter().enumerate().find(|(_, r)| r.matches(v)) {
+                best = Some(match best {
+                    None => (idx, rule),
+                    Some((bi, br)) => {
+                        if severity(rule.action) > severity(br.action)
+                            || (severity(rule.action) == severity(br.action) && idx < bi)
+                        {
+                            (idx, rule)
+                        } else {
+                            (bi, br)
+                        }
+                    }
+                });
             }
         }
-        Decision {
-            action: self.default,
-            matched_rule: None,
-            reason: format!("no rule matched; policy default is `{}`", self.default),
+        match best {
+            Some((_, rule)) => Decision {
+                action: rule.action,
+                matched_rule: Some(rule.r#match.clone()),
+                reason: rule
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| format!("matched rule `{}`", rule.r#match)),
+            },
+            None => Decision {
+                action: self.default,
+                matched_rule: None,
+                reason: format!("no rule matched; policy default is `{}`", self.default),
+            },
         }
     }
+}
+
+/// The forms of a command a rule is matched against.
+///
+/// v0.15. Until now there was one: whitespace-collapsed and lowercased. Two
+/// separate bugs came out of that single reading.
+///
+/// **Quotes.** `normalize` leaves them in, so `"rm" -rf /` missed the
+/// `rm -rf /*` deny rule while the intent classifier — which tokenizes, and so
+/// strips them — correctly called it a file delete. The layer that understood
+/// the command was not the layer that blocked it. Same for `rm -r''f /`.
+///
+/// **Case.** `evaluate` lowercased the RULE as well as the command, so
+/// `git branch -D` and `git branch -d` were both `git branch -d` before
+/// `wildcard_match` ever ran. The distinction was destroyed at parse time, and
+/// no amount of comparing forms at the match site could recover it. A rule
+/// could not mean `-D` even if it spelled it.
+///
+/// So: three readings, and a rule matching ANY of them applies.
+///
+/// 1. `normalize` — whitespace-collapsed, lowercased. What we always had.
+/// 2. tokenized-and-rejoined, lowercased — quotes gone, so disguises fail.
+/// 3. tokenized-and-rejoined, CASE PRESERVED — so a rule that spells `-D`
+///    in capitals means it.
+///
+/// This is strictly a widening: every rule that matched before still matches,
+/// because reading 1 is unchanged. It can only make the gate more severe.
+///
+/// Reported by Tim Schipper.
+pub fn readings(command: &str) -> Vec<String> {
+    let base = normalize(command);
+    let toks = crate::intent::tokens(command).join(" ");
+    let cased = toks.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lowered = cased.to_lowercase();
+
+    let mut out = vec![base];
+    if !out.contains(&lowered) {
+        out.push(lowered);
+    }
+    if !out.contains(&cased) {
+        out.push(cased);
+    }
+    out
 }
 
 /// Collapse whitespace runs to single spaces, trim, and lowercase.
@@ -217,6 +325,143 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Schipper review round 2, finding 2. `intent::tokens` strips quotes and
+    /// `policy::normalize` does not, so the classifier saw through disguises
+    /// the gate could not. The layer that understood the command was not the
+    /// layer that blocked it.
+    #[test]
+    fn quoting_cannot_disguise_a_command_from_a_rule() {
+        let p = Policy::builtin().unwrap();
+        for cmd in [
+            r#""rm" -rf /"#,
+            r#"rm -r''f /"#,
+            r#""rm" "-rf" "/""#,
+            r#"'rm' -rf /"#,
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                Action::Deny,
+                "{cmd} must not slip past the deny rule by quoting"
+            );
+        }
+    }
+
+    /// The case-preservation half. A lowercase rule stays case-insensitive; a
+    /// rule with an uppercase letter is matched as written.
+    #[test]
+    fn a_lowercase_rule_still_matches_either_case() {
+        let p = Policy::builtin().unwrap();
+        // `*drop table*` is written lowercase, so it must catch both.
+        assert_eq!(
+            p.evaluate_command("psql -c \"DROP TABLE users\"").action,
+            Action::Deny
+        );
+        assert_eq!(
+            p.evaluate_command("psql -c \"drop table users\"").action,
+            Action::Deny
+        );
+        // `*rm -rf*` likewise.
+        assert_eq!(p.evaluate_command("rm -RF /tmp/x").action, Action::Deny);
+    }
+
+    /// Until v0.15 this was impossible: `evaluate` lowercased the rule as well
+    /// as the command, so `-D` and `-d` were the same string before matching.
+    /// The distinction is opted into with `case_sensitive: true`.
+    #[test]
+    fn a_case_sensitive_rule_means_the_case_it_spells() {
+        let rule = Rule {
+            r#match: "git branch*-D*".into(),
+            action: Action::Deny,
+            reason: None,
+            case_sensitive: true,
+        };
+        let views_upper = readings("git branch -D main");
+        let views_lower = readings("git branch -d main");
+
+        assert!(
+            views_upper.iter().any(|v| rule.matches(v)),
+            "a case-sensitive rule spelling -D must match -D"
+        );
+        assert!(
+            !views_lower.iter().any(|v| rule.matches(v)),
+            "a case-sensitive rule spelling -D must NOT match -d — that was the bug"
+        );
+    }
+
+    /// The collateral the first draft shipped, kept impossible: an uppercase
+    /// SPELLING without the field changes nothing. `*Remove-Item*-Recurse*`
+    /// has shipped case-insensitive since v0.11, PowerShell accepts any
+    /// casing, and agents emit it.
+    #[test]
+    fn uppercase_spelled_rules_stay_case_insensitive_without_the_field() {
+        let p = Policy::builtin().unwrap();
+        for cmd in [
+            "remove-item -recurse -force c:\\temp\\x",
+            "REMOVE-ITEM -Recurse c:\\x",
+            // NOTE: *Get-ChildItem*Remove-Item* is NOT here — it was already
+            // unreachable in v0.14.2 (split_segments cuts pipelines at `|`,
+            // so both words never share a segment). Reported separately.
+            "remove-item -force c:\\x",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                Action::Deny,
+                "{cmd} matched a deny in v0.14.2 and must keep matching"
+            );
+        }
+        // And the starter policy opts in exactly once, on purpose.
+        let cs: Vec<&str> = p
+            .rules
+            .iter()
+            .filter(|r| r.case_sensitive)
+            .map(|r| r.r#match.as_str())
+            .collect();
+        assert_eq!(
+            cs,
+            vec!["git branch*-D*"],
+            "case sensitivity is a deliberate, rare opt-in"
+        );
+    }
+
+    /// Severity across readings, against the #16 exception block. A quoted
+    /// spelling only the tokenized reading recognises as the excepted command
+    /// fails CLOSED — the raw reading hits the `*.termaxa*` deny below the
+    /// exception, and the more severe verdict governs. The plain spelling is
+    /// untouched. Stated behavior change to the exception block, not a slip.
+    #[test]
+    fn a_quoted_spelling_of_an_excepted_command_fails_closed() {
+        let p = Policy::builtin().unwrap();
+        assert_eq!(
+            p.evaluate_command("cat .termaxa/policy.yaml").action,
+            Action::Allow,
+            "the plain excepted read stays allowed"
+        );
+        assert_eq!(
+            p.evaluate_command(r#""cat" .termaxa/policy.yaml"#).action,
+            Action::Deny,
+            "a disguised spelling of a .termaxa read fails closed, loudly"
+        );
+    }
+
+    /// The whole change is a widening. Reading 1 is unchanged, so nothing that
+    /// matched before can stop matching.
+    #[test]
+    fn the_extra_readings_can_only_add_matches() {
+        for cmd in [
+            "git status",
+            "ls -la",
+            "cargo build",
+            "echo hello world",
+            "git push --force origin main",
+        ] {
+            let base = normalize(cmd);
+            assert!(
+                readings(cmd).contains(&base),
+                "the original normalized reading must always be present"
+            );
+        }
+    }
 
     #[test]
     fn wildcard_basics() {
@@ -500,5 +745,35 @@ rules:
                 "a prefix is not a command: {cmd}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod combined_gate_tests {
+    use super::*;
+
+    /// The `./` spelling is a KNOWN gap, pinned so a future fix flips this
+    /// test consciously: `cat /dev/null > ./.env` walks past the `*> .env*`
+    /// string rules (belt), but the redirect scanner still extracts the
+    /// target (suspenders) — intent classifies it and insurance backs the
+    /// file up before execution, whatever the spelling. The full fix is
+    /// matching on the RESOLVED target (v0.16, with #12's signal set).
+    #[test]
+    fn the_dot_slash_spelling_is_a_known_gap_with_insurance_beneath() {
+        let p = Policy::builtin().unwrap();
+        assert_eq!(
+            p.evaluate_command("cat /dev/null > ./.env").action,
+            Action::Allow,
+            "known gap — if this starts denying, delete this test and the comment"
+        );
+        let r = crate::shell::redirect_targets("cat /dev/null > ./.env");
+        assert!(
+            r.len() == 1 && r[0].truncates && r[0].target == "./.env",
+            "the net beneath: insurance sees the spelling the string rules miss"
+        );
+        // And the write-tool path (Schipper, #20) guards the same files the
+        // shell path guards, independent of both.
+        assert!(crate::protect::classify(".", ".termaxa/policy.yaml").is_some());
+        assert!(crate::protect::classify(".", "src/main.rs").is_none());
     }
 }

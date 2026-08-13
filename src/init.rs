@@ -14,9 +14,11 @@ pub const STARTER_POLICY: &str = r#"# Termaxa policy — first matching rule win
 # that can never be reached is not a rule. Put your own exceptions ABOVE the
 # deny you want them to override — that is what first-match-wins is for.
 #
-# Matching is case-insensitive, so a rule cannot distinguish `-D` from `-d`.
-# Where a flag's case carries the meaning (git branch -D, rm -R), the rule
-# covers both and the action is chosen for the safer of the two.
+# Matching is case-insensitive unless a rule opts in with
+# `case_sensitive: true` (rare; used where a flag's case carries the meaning,
+# like `git branch -D` vs `-d`). Quoting cannot disguise a command: rules are
+# matched against the tokenized reading as well as the raw one, and the most
+# severe verdict governs.
 version: 1
 default: ask
 
@@ -57,6 +59,41 @@ rules:
   - match: "*.github*hooks*"
     action: deny
     reason: "Agent hook configuration is off limits — editing it unhooks the gate."
+
+  # ---- destruction by overwrite (v0.15) ----
+  #
+  # `>` truncates. Until v0.15 the operator was lexed and discarded, so
+  # `cat /dev/null > .env` matched the read-only `cat *` rule and was ALLOWED.
+  # Nothing was deleted; the contents were simply replaced.
+  #
+  # POSITION IS LOAD-BEARING, twice over. These sit with the self-defence
+  # denies and ABOVE the .termaxa read exceptions below, because those
+  # exceptions end in `*` and a trailing `*` swallows a redirect — placed any
+  # lower, `cat .termaxa/policy.yaml > .env` matches `cat .termaxa*` and the
+  # gate's own reviewability exception launders the overwrite it exists to
+  # stop. `the_gates_own_exception_cannot_launder_an_overwrite` holds this.
+  #
+  # These rules cover the paths whose loss is not recoverable from the repo.
+  # Everything else that truncates is classified `file-overwrite` and insured
+  # (backup::overwrite_targets copies the file aside first), but is NOT gated
+  # here: agents write files constantly, and a gate that asks on every redirect
+  # is auto-approved into meaninglessness. Insurance without friction is the
+  # trade — see #14.
+  - match: "*> .env*"
+    action: deny
+    reason: "Overwriting .env destroys credentials that are not in the repo."
+  - match: "*>.env*"
+    action: deny
+    reason: "Overwriting .env destroys credentials that are not in the repo."
+  - match: "*> /etc/*"
+    action: deny
+    reason: "Overwriting a system config file."
+  - match: "*> ~/.ssh/*"
+    action: deny
+    reason: "Overwriting an SSH key or config."
+  - match: "*> *id_rsa*"
+    action: deny
+    reason: "Overwriting an SSH private key."
 
   # The policy is an in-repo artifact, reviewable in PRs, and the deny below
   # would otherwise make that workflow impossible: `git add .termaxa/…`,
@@ -155,12 +192,41 @@ rules:
     reason: "tofu destroy is blocked by policy."
 
   # ---- consequential: human in the loop ----
-  # `git branch -D` force-deletes an unmerged branch. Case-insensitive
-  # matching cannot separate it from the safe `-d`, so this asks rather than
-  # denies; the commits remain in the reflog either way.
+  #
+  # RECOVERABILITY INVARIANT (v0.15). A destructive rule may be `ask` only if
+  # something can undo it. If neither Termaxa nor the system can, it denies —
+  # because `ask` under an auto-approving UI is `allow`, and an `allow` you
+  # cannot undo is the failure this tool exists to prevent.
+  #
+  # Recovery paths that count, and who provides them:
+  #   termaxa file snapshot   rm and friends            (backup::rm_targets)
+  #   termaxa pg_dump         psql/mysql destructive    (backup::pg_backup_targets)
+  #   termaxa git ref pin     push --force              (backup::git_force_push_target)
+  #   termaxa tfstate copy    terraform apply/destroy   (backup::tf_state_target)
+  #   git reflog              branch -D, reset --hard   (git's own, ~90 days)
+  #   the registry            npm/cargo publish         (yank; not deletion)
+  #   the remote              gh pr merge               (revert commit)
+  #
+  # `the_starter_policy_has_no_uninsurable_asks` enforces this. A destructive
+  # rule added here without a recovery path fails the build.
+  # `git branch -D` force-deletes an unmerged branch; `-d` refuses unless it is
+  # merged. Until v0.15 a rule could not tell them apart, because matching
+  # lowercased the rule as well as the command — so this asked for both and
+  # took the safer action for the gentler flag.
+  #
+  # A rule can now opt in with `case_sensitive: true`, matched as written, so
+  # these can differ. The opt-in is explicit and rare on purpose: an uppercase
+  # SPELLING alone changes nothing (`*Remove-Item*` still catches
+  # `remove-item`). `-D` still asks rather than denies, because the commits
+  # survive in the reflog for ~90 days and denying outright would block a
+  # routine cleanup; but it says which one it caught.
+  - match: "git branch*-D*"
+    case_sensitive: true
+    action: ask
+    reason: "Force-deleting a branch even if unmerged. Recoverable via git reflog."
   - match: "git branch*-d*"
     action: ask
-    reason: "Deleting a branch. `-D` force-deletes even if unmerged."
+    reason: "Deleting a merged branch."
   - match: "git push*"
     action: ask
   - match: "terraform apply*"
@@ -169,8 +235,21 @@ rules:
     action: ask
   - match: "docker rm*"
     action: ask
+  # No recovery path: prune deletes unused images, containers, networks and
+  # (with -a or --volumes) data that nothing else holds a copy of. Termaxa
+  # cannot snapshot a docker volume and docker keeps no undo. Denied rather
+  # than asked, per the invariant above.
   - match: "docker system prune*"
-    action: ask
+    action: deny
+    reason: "docker system prune has no recovery path. Remove specific objects instead."
+  # Raw device writes destroy partition tables and filesystems with nothing
+  # to restore from. Not insurable at any layer.
+  - match: "dd*of=/dev/*"
+    action: deny
+    reason: "Writing to a raw device is not recoverable."
+  - match: "mkfs*"
+    action: deny
+    reason: "Formatting a device is not recoverable."
   - match: "npm publish*"
     action: ask
   - match: "cargo publish*"
@@ -565,6 +644,110 @@ mod tests {
             "examples/policy.yaml has drifted from init::STARTER_POLICY. \
              Regenerate it rather than editing it by hand."
         );
+    }
+
+    /// RECOVERABILITY INVARIANT (v0.15).
+    ///
+    /// A destructive rule may be `ask` only if something can undo it. Under an
+    /// auto-approving UI `ask` is `allow`, so an uninsurable `ask` is an
+    /// unrecoverable `allow` wearing a prompt.
+    ///
+    /// This test is deliberately narrow. "Insurable" here means a recovery path
+    /// we can name and point at — not a general predicate, which we do not have.
+    /// Adding a destructive rule without one fails the build, and the fix is
+    /// either to add the recovery path or to state why it does not need one.
+    #[test]
+    fn the_starter_policy_has_no_uninsurable_asks() {
+        let p: crate::policy::Policy = serde_yaml::from_str(STARTER_POLICY).unwrap();
+
+        // Every `ask` rule, and the recovery path that justifies it. A rule
+        // reaching this list without an entry is the point of the test.
+        let recovery: &[(&str, &str)] = &[
+            ("git branch*-D*", "git reflog retains the commits"),
+            (
+                "git branch*-d*",
+                "git refuses unless merged; reflog retains either way",
+            ),
+            ("git push*", "termaxa pins the remote ref before the push"),
+            ("terraform apply*", "termaxa copies tfstate first"),
+            ("tofu apply*", "termaxa copies tfstate first"),
+            ("docker rm*", "named container; image and volumes survive"),
+            ("npm publish*", "npm deprecate/unpublish window"),
+            ("cargo publish*", "cargo yank"),
+            ("gh pr merge*", "the merge commit can be reverted"),
+            ("aws *", "not destructive by itself; breadth is why it asks"),
+            (
+                "curl*",
+                "not destructive by itself; network egress is why it asks",
+            ),
+            (
+                "ssh *",
+                "not destructive by itself; remote execution is why it asks",
+            ),
+        ];
+
+        let mut unjustified = Vec::new();
+        for rule in p
+            .rules
+            .iter()
+            .filter(|r| r.action == crate::policy::Action::Ask)
+        {
+            if !recovery.iter().any(|(m, _)| *m == rule.r#match) {
+                unjustified.push(rule.r#match.clone());
+            }
+        }
+
+        assert!(
+            unjustified.is_empty(),
+            "these `ask` rules have no documented recovery path: {unjustified:?}\n\
+             Either add the recovery path to backup.rs and list it here, or make \
+             the rule `deny`. An ask that cannot be undone is an allow that \
+             cannot be undone."
+        );
+    }
+
+    /// The break the pre-#16 draft shipped, kept impossible: the anchored
+    /// `.termaxa` read exceptions end in `*`, a trailing `*` swallows a
+    /// redirect (#16's own commit message), and overwrite denies placed below
+    /// them were laundered by the gate's own reviewability exception. The
+    /// denies now sit above; one command reading the policy and wiping a
+    /// credentials file must never be an allow.
+    #[test]
+    fn the_gates_own_exception_cannot_launder_an_overwrite() {
+        let p: crate::policy::Policy = serde_yaml::from_str(STARTER_POLICY).unwrap();
+        for cmd in [
+            "cat .termaxa/policy.yaml > .env",
+            "cat .termaxa/policy.yaml > /etc/hosts",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                crate::policy::Action::Deny,
+                "{cmd} must not be allowed via the .termaxa read exception"
+            );
+        }
+        // The exception itself still works — that is what it is for.
+        assert_eq!(
+            p.evaluate_command("cat .termaxa/policy.yaml").action,
+            crate::policy::Action::Allow
+        );
+    }
+
+    /// The three the invariant moved, and why. Named so a future reshuffle
+    /// that quietly relaxes them fails loudly.
+    #[test]
+    fn the_uninsurable_commands_are_denied_not_asked() {
+        let p: crate::policy::Policy = serde_yaml::from_str(STARTER_POLICY).unwrap();
+        for cmd in [
+            "docker system prune -a",
+            "dd if=/dev/zero of=/dev/sda",
+            "mkfs.ext4 /dev/sdb1",
+        ] {
+            assert_eq!(
+                p.evaluate_command(cmd).action,
+                crate::policy::Action::Deny,
+                "{cmd} has no recovery path and must deny, not ask"
+            );
+        }
     }
 
     /// Schipper review, finding 3: order is load-bearing, so assert the shape
