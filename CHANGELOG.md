@@ -2,7 +2,7 @@
 
 All notable changes to Termaxa. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0, so minor versions may include breaking changes to the policy schema or CLI.
 
-## Unreleased
+## v0.15.0 — stop treating commands as strings
 
 ### Changed
 
