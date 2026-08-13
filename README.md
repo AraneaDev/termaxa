@@ -162,33 +162,36 @@ $ termaxa doctor
 
 Termaxa doctor
 ──────────────────────────────────────────
-✓ termaxa 0.13.0
+✓ termaxa 0.15.0
   /home/you/.cargo/bin/termaxa
 
 Policy
 ✓ /home/you/project/.termaxa/policy.yaml
-  38 rule(s), default ask
+  67 rule(s), default ask
+  fingerprint 1aa53b6e0d64
+  ✓ unchanged since 2026-08-13T18:10:22Z
 
 Agents
-✓ Claude Code   hook configured
-! Cursor        detected, hook NOT configured
-    termaxa init --cursor
+✓ Claude Code  hook configured and live
 
 Preview support
-✓ git         force-push previews and git backups
-✓ psql        Postgres blast radius
-· terraform   plan previews unavailable
+✓ git        force-push previews and git backups
+· psql       Postgres blast radius unavailable
+· pg_dump    Postgres backups unavailable
+· terraform  plan previews unavailable
 
 State
-✓ /home/you/.termaxa/projects/project-aae9b64c
-  412 audit entries (388 from hooks)
+✓ /home/you/.termaxa/projects/project-4005e00d
+  3 audit entries (3 from hooks)
 
 ──────────────────────────────────────────
-! 1 to fix:
-  · wire Cursor — `termaxa init --cursor`
+✓ Everything checks out.
+  proof is in the log: run your agent, then `termaxa report`
 ```
 
-It reports what it can verify: a hook is **configured**, never that it *fires*. If an agent is wired but no hook entries exist in the log, doctor says so and points you at `TERMAXA_HOOK_DEBUG` — because agents rename their hook APIs, and when they do, the gate fails open and silent (see [Honest limitations](#honest-limitations)). Doctor is read-only: it never creates the state it reports on.
+**Configured and live** is earned, not assumed: doctor invokes the registered hook command exactly as the agent would — synthetic must-deny payload on stdin, two-second timeout — and requires a decision back. Three states: **configured and live** (it answered), **registered but NOT firing** (a registration exists, the command doesn't run — worse than absent, because it's the state that *looks* safe), and **not configured**. Until v0.15 doctor only checked that a registration existed; a hook whose path was mangled at exec failed non-blocking, two full sessions ran ungated, and doctor said "configured" in green throughout.
+
+Two honest boundaries. The probe only runs binaries named `termaxa` — a settings file arrives with a cloned repo and is untrusted input. And **live means "answered when doctor invoked it"**: if the agent's own invocation is broken on the agent's side, the probe can't see that — which is why doctor pairs it with the log. Live here plus no recent hook entries there means the agent has never reached the gate; doctor says so and points you at `TERMAXA_HOOK_DEBUG`, because agents rename their hook APIs, and when they do, the gate fails open and silent (see [Honest limitations](#honest-limitations)). Doctor is read-only, probe included: no backup, no audit entry, no notification — proven by test against the real binary.
 
 ### After a session: the report
 
@@ -362,7 +365,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model.
 
 ## Contributing
 
-Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is ~8,300 lines of dependency-light Rust — `src/policy.rs` and `src/preview.rs` are the best places to start reading.
+Issues and PRs welcome. `cargo test` must pass; CI runs on Linux, macOS, and Windows. The codebase is ~10,700 lines of dependency-light Rust — `src/policy.rs` and `src/preview.rs` are the best places to start reading.
 
 If you can make an agent get past the gate in a way that isn't already documented above, that's the most useful contribution you can make: [open an issue](https://github.com/termaxa/termaxa/issues) or email security@termaxa.com.
 
