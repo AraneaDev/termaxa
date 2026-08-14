@@ -119,6 +119,22 @@
         "reason": "unreachable: this is a duplicate of the `if input.is_post` block above it, which returns Ok(()) for every post input, so nothing here executes. Not equivalent — dead. The block should be deleted; the suppression goes away with it",
         "fingerprint": "c7754d516339"
       }
+    ],
+    "src/delete.rs": [
+      {
+        "line": 224,
+        "mutator": "delete match arm \"rm\" | \"unlink\" in is_flag",
+        "addedAt": 1786732519506,
+        "reason": "equivalent: the arm's body is byte-identical to the `_` default arm (token.starts_with('-')), so deleting it changes no behaviour. It exists to document that a leading slash is a PATH for POSIX deletes, which is what keeps `rm -rf /c` a target",
+        "fingerprint": "9566f08c4f6b"
+      },
+      {
+        "line": 226,
+        "mutator": "delete match arm \"remove-item\" | \"ri\" in is_flag",
+        "addedAt": 1786732519506,
+        "reason": "equivalent: the arm's body is byte-identical to the `_` default arm (token.starts_with('-')), so deleting it changes no behaviour. It exists to document that PowerShell never uses a leading slash for switches",
+        "fingerprint": "5b4c79689c91"
+      }
     ]
   }
 }
