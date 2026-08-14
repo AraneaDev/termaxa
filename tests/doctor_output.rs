@@ -246,13 +246,25 @@ fn each_agent_is_detected_by_its_own_evidence() {
     stub_tool(&bin, "gh");
 
     let out = doctor(&tmp.join("home"), &proj, &bin);
-    for agent in ["Claude Code", "Cursor", "Copilot"] {
+    // The agent LINE and its state, not the bare name: every name also appears
+    // in the list of things to fix, so `contains("Cursor")` is satisfied by the
+    // output of NOT detecting it. Each agent here is detected a different way
+    // and lands in a different state, and the assertion says which.
+    for agent in ["Claude Code", "Cursor"] {
         assert!(
-            out.stdout.contains(agent),
-            "{agent} should have been detected: {:?}",
+            out.stdout
+                .contains(&format!("{agent:<13}detected, hook NOT configured")),
+            "{agent} is detected by its directory alone, and is not wired: {:?}",
             out.stdout
         );
     }
+    assert!(
+        out.stdout
+            .contains(&format!("{:<13}hook configured and live", "Copilot CLI")),
+        "Copilot is detected by gh on PATH plus a registration, and that \
+         registration answers: {:?}",
+        out.stdout
+    );
     assert!(
         !out.stdout.contains("no agent harness detected"),
         "{:?}",
@@ -263,6 +275,35 @@ fn each_agent_is_detected_by_its_own_evidence() {
     assert!(
         !out.stdout.contains("restart Cursor"),
         "nothing was wired, so there is nothing to restart for: {:?}",
+        out.stdout
+    );
+}
+
+#[test]
+fn a_wired_cursor_is_told_to_restart() {
+    // The counterpart to the silence asserted above. Without this, deleting
+    // the hint from doctor entirely would break no test: an absence is only
+    // meaningful next to a presence.
+    let tmp = scratch("cursor-wired");
+    let bin = controlled_path(&tmp);
+    let proj = project(&tmp, DENIES);
+    let dir = proj.join(".cursor");
+    std::fs::create_dir_all(&dir).expect("agent dir must be creatable");
+    std::fs::write(
+        dir.join("hooks.json"),
+        serde_json::json!({
+            "beforeShellExecution": [
+                { "command": format!("{} hook", env!("CARGO_BIN_EXE_termaxa")) }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("hooks must be writable");
+
+    let out = doctor(&tmp.join("home"), &proj, &bin);
+    assert!(
+        out.stdout.contains("restart Cursor"),
+        "a registration Cursor has not reloaded is a hook that does not fire: {:?}",
         out.stdout
     );
 }
@@ -330,7 +371,14 @@ fn an_unregistered_agent_directory_is_reported_as_not_wired() {
     std::fs::create_dir_all(proj.join(".claude")).expect("agent dir must be creatable");
 
     let out = doctor(&tmp.join("home"), &proj, &bin);
-    assert!(out.stdout.contains("Claude Code"), "{:?}", out.stdout);
+    assert!(
+        out.stdout.contains(&format!(
+            "{:<13}detected, hook NOT configured",
+            "Claude Code"
+        )),
+        "{:?}",
+        out.stdout
+    );
     assert!(
         !out.stdout.contains("no agent harness detected"),
         "the directory alone is enough to detect the harness: {:?}",

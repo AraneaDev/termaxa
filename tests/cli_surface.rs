@@ -172,6 +172,13 @@ fn log_filters_by_decision_and_by_source() {
     termaxa(&home, &proj, &["check", "cat notes.txt"], "");
     termaxa(&home, &proj, &["run", "--", "sh", "-c", "exit 0"], "");
 
+    // The control leg: unfiltered, BOTH commands are there. Without it, a
+    // filter test proves nothing when the seeding silently failed, because an
+    // empty log excludes everything perfectly.
+    let all = termaxa(&home, &proj, &["log", "-n", "50"], "").stdout;
+    assert!(all.contains("rm -rf /"), "{all:?}");
+    assert!(all.contains("cat notes.txt"), "{all:?}");
+
     let denied = termaxa(&home, &proj, &["log", "--decision", "deny"], "").stdout;
     assert!(denied.contains("rm -rf /"), "{denied:?}");
     assert!(
@@ -229,6 +236,12 @@ fn stats_ranks_the_commands_that_were_denied() {
         "",
     );
     termaxa(&home, &proj, &["check", "cat notes.txt"], "");
+
+    // Same control: the allowed command is in the log, so its absence from the
+    // denial ranking below is the ranking working rather than the log being
+    // empty.
+    let all = termaxa(&home, &proj, &["log", "-n", "50"], "").stdout;
+    assert!(all.contains("cat notes.txt"), "{all:?}");
 
     let stats = termaxa(&home, &proj, &["stats"], "").stdout;
     assert!(stats.contains("top denied"), "{stats:?}");
