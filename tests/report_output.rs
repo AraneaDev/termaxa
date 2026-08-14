@@ -55,7 +55,7 @@ fn the_markdown_report_carries_the_counts_and_the_risk_formula() {
     let proj = project(&tmp);
 
     // Three decisions the policy above produces: one deny, two allows.
-    termaxa(&home, &proj, &["check", "rm -rf /"]);
+    termaxa(&home, &proj, &["check", "rm -rf /nonexistent-tmx-fixture"]);
     termaxa(&home, &proj, &["check", "ls -la"]);
     termaxa(&home, &proj, &["check", "ls"]);
 
@@ -96,7 +96,7 @@ fn the_terminal_report_renders_the_same_facts_in_its_own_shape() {
     let home = tmp.join("home");
     let proj = project(&tmp);
 
-    termaxa(&home, &proj, &["check", "rm -rf /"]);
+    termaxa(&home, &proj, &["check", "rm -rf /nonexistent-tmx-fixture"]);
     termaxa(&home, &proj, &["check", "ls"]);
 
     let out = termaxa(&home, &proj, &["report", "--all"]);
@@ -248,7 +248,7 @@ fn the_risk_label_is_coloured_by_its_own_severity() {
         "Low risk is green, got: {low:?}"
     );
 
-    coloured(&["check", "rm -rf /"]);
+    coloured(&["check", "rm -rf /nonexistent-tmx-fixture"]);
     let medium = coloured(&["report", "--all"]);
     assert!(
         medium.contains("\x1b[33mMedium"),
