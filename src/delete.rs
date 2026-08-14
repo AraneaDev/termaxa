@@ -519,6 +519,7 @@ pub fn scan_budgeted(root: &Path) -> Scan {
     }
 
     while let Some(dir) = stack.pop() {
+        // Budget check at the pop bounds long runs of small directories…
         if files >= MAX_FILES || start.elapsed() > MAX_TIME {
             return Scan {
                 files,
@@ -531,6 +532,26 @@ pub fn scan_budgeted(root: &Path) -> Scan {
         };
         dirs += 1;
         for e in entries.flatten() {
+            // …and the check HERE bounds one large directory. Until v0.16 the
+            // budget was only consulted between directories, so a single big
+            // dir ran to completion: thousands of symlink_metadata calls with
+            // no way to stop. On a filesystem where each stat costs
+            // milliseconds — WSL2 with Windows drives mounted was the field
+            // case — that turned a 300ms budget into 5.8–7.1 measured seconds,
+            // blew the doctor probe's 2s timeout, and a correctly gated setup
+            // reported "registered but NOT firing". hook_configured inverted:
+            // red over a gated session. It also let a flat directory of 6,000
+            // files overrun MAX_FILES and return capped:false. Reported by
+            // Tim Schipper. The residue, stated: a budget can only act BETWEEN
+            // syscalls — one genuinely hung stat (dead network mount) is the
+            // OS's to interrupt, not ours.
+            if files >= MAX_FILES || start.elapsed() > MAX_TIME {
+                return Scan {
+                    files,
+                    dirs,
+                    capped: true,
+                };
+            }
             // symlink_metadata: do NOT follow links. Following them would both
             // inflate the count and risk walking out of the target entirely
             // (see the junction-traversal issue).
@@ -821,6 +842,31 @@ mod tests {
         assert_eq!(scan.files, 17, "must count files recursively");
         assert_eq!(scan.dirs, 2);
         assert!(!scan.capped, "17 files is well under the budget");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The field case, made deterministic: the budget must bind INSIDE one
+    /// directory, not just between directories. Before the fix this returned
+    /// files=5500, capped=false — over budget and misreported. (The time
+    /// half of the same check can't be pinned without a slow filesystem;
+    /// it is the same line of code, so this count test holds both.)
+    #[test]
+    fn a_single_large_directory_cannot_blow_the_budget() {
+        let tmp = TempTree::new("scan-flat");
+        let dir = tmp.path().to_path_buf();
+        for i in 0..(MAX_FILES + 500) {
+            std::fs::write(dir.join(format!("f{i}")), "").unwrap();
+        }
+        let scan = scan_budgeted(&dir);
+        assert!(
+            scan.capped,
+            "a flat directory larger than the budget must report capped"
+        );
+        assert!(
+            scan.files <= MAX_FILES,
+            "the count must stop at the budget, not at the directory's end: {}",
+            scan.files
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
