@@ -342,6 +342,25 @@ mod tests {
         assert!(redirect_targets("cmd <> rw.txt").is_empty());
     }
 
+    /// The empty-target guard, exercised: a trailing redirect names nothing
+    /// and must push nothing. The last of the five predicted survivors; the
+    /// other four died to `every_sink_spelling_is_a_sink` above.
+    #[test]
+    fn a_trailing_redirect_with_no_target_pushes_nothing() {
+        for cmd in ["cmd >", "cmd > ", "cmd >>", "cmd >|", "echo x 2>"] {
+            assert!(
+                redirect_targets(cmd).is_empty(),
+                "{cmd:?} names no target and must push no Overwrite"
+            );
+        }
+        // Behavior pin, not a mutant killer: the pass ruled both
+        // trailing-backslash bound mutants EQUIVALENT (f6a2746dc86a) - no
+        // input distinguishes the spellings, so this pins the behavior
+        // they share: a bare trailing escape ends the scan with nothing
+        // pushed.
+        assert!(redirect_targets("echo x \\").is_empty());
+    }
+
     #[test]
     fn several_redirects_in_one_segment() {
         let r = redirect_targets("cmd > out.txt 2> err.txt");
