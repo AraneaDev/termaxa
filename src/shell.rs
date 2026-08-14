@@ -430,4 +430,184 @@ mod tests {
         assert!(!has_substitution("echo '$(safe)'"));
         assert!(!has_substitution("git status"));
     }
+
+    // -----------------------------------------------------------------------
+    // The edges of the character walk.
+    //
+    // Both parsers in this file were tested on realistic commands and never on
+    // the boundaries: a quote of one kind inside the other, an operator at the
+    // very end of the input, a segment that BEGINS with a redirect, an escape
+    // with nothing after it. Those are where a hand-written lexer goes wrong,
+    // and where a command slips past the gate whole.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_quote_of_one_kind_does_not_open_the_other() {
+        // If the apostrophe in `it's` opened a single-quoted run, everything
+        // after it would be literal text and the `&&` would stop separating
+        // commands. That is a bypass, not a formatting quirk.
+        let segs = split_segments("echo \"it's fine\" && rm -rf /tmp/x");
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert!(segs[1].starts_with("rm -rf"), "{segs:?}");
+
+        let segs = split_segments("echo 'say \"hi\"' && rm -rf /tmp/x");
+        assert_eq!(segs.len(), 2, "{segs:?}");
+
+        // Same question for the redirect scanner: the apostrophe must not
+        // swallow the `>` that follows it.
+        let targets = redirect_targets("echo \"it's\" > out.txt");
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0].target, "out.txt");
+
+        let targets = redirect_targets("echo 'a \"b\"' > out.txt");
+        assert_eq!(targets[0].target, "out.txt");
+    }
+
+    #[test]
+    fn single_quotes_hide_a_substitution_and_double_quotes_do_not() {
+        // In a shell, `'` protects a backtick and `"` does not. Reading it the
+        // other way round either misses a substitution or flags every string.
+        assert!(!has_substitution("echo 'a `b` c'"));
+        assert!(has_substitution("echo \"a `b` c\""));
+        assert!(!has_substitution("echo 'a $(b) c'"));
+        assert!(has_substitution("echo \"a $(b) c\""));
+    }
+
+    #[test]
+    fn an_operator_at_the_very_end_is_not_read_past() {
+        // Each of these ends on a character whose handler looks at the NEXT
+        // one. Reading past the end is a panic in the hook, which is a gate
+        // that stopped answering.
+        assert_eq!(split_segments("ls &"), ["ls"]);
+        assert_eq!(split_segments("ls |"), ["ls"]);
+        assert_eq!(split_segments("ls &&"), ["ls"]);
+        assert_eq!(split_segments("ls ||"), ["ls"]);
+        // A trailing backslash, inside quotes and bare.
+        assert_eq!(split_segments("echo \"a\\"), ["echo \"a\\"]);
+        assert_eq!(redirect_targets("echo a\\").len(), 0);
+        assert_eq!(redirect_targets("echo > out.txt\\").len(), 1);
+    }
+
+    #[test]
+    fn a_segment_may_begin_with_the_operator() {
+        // Nothing precedes the first character, and the checks for "what came
+        // before this?" have to survive that.
+        let targets = redirect_targets("> out.txt");
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0].target, "out.txt");
+        assert!(targets[0].truncates);
+
+        // A leading `&>` combines streams rather than truncating a file, and
+        // asking what precedes the `&` must not run off the front.
+        assert_eq!(redirect_targets("&> log.txt").len(), 0);
+        assert_eq!(split_segments("&> log.txt"), ["&> log.txt"]);
+    }
+
+    #[test]
+    fn a_redirect_with_nothing_after_it_has_no_target() {
+        // The skip-the-whitespace loop runs to the end of the input here, so
+        // the bound on it is the only thing between this and a panic.
+        assert_eq!(redirect_targets("echo >").len(), 0);
+        assert_eq!(redirect_targets("echo >   ").len(), 0);
+        assert_eq!(redirect_targets("echo >>").len(), 0);
+    }
+
+    #[test]
+    fn a_quoted_target_keeps_the_spaces_inside_it() {
+        // The quote has to close, or the scan swallows the rest of the line
+        // and reports a target nobody wrote.
+        let targets = redirect_targets("echo > 'my file.txt' && ls");
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0].target, "my file.txt");
+
+        let targets = redirect_targets("echo > \"my file.txt\"");
+        assert_eq!(targets[0].target, "my file.txt");
+    }
+
+    #[test]
+    fn an_unbalanced_quote_inside_the_other_kind_changes_nothing() {
+        // A balanced pair proves less than it looks: toggling the wrong state
+        // twice returns it to where it started. One `"` inside single quotes
+        // is what shows whether the guard is consulted, and if it is not, the
+        // `&&` after it stops separating commands.
+        let segs = split_segments("echo 'it\"s' && rm -rf /tmp/x");
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert!(segs[1].starts_with("rm -rf"), "{segs:?}");
+
+        let targets = redirect_targets("echo 'a\"b' > out.txt");
+        assert_eq!(targets.len(), 1, "the redirect is outside the quotes: {targets:?}");
+        assert_eq!(targets[0].target, "out.txt");
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_close_the_string_it_is_inside() {
+        // `"a\"b && c"` is one argument containing an ampersand pair, not two
+        // commands. If the escape is not honoured, the `"` closes the string
+        // and the `&&` becomes a separator.
+        let segs = split_segments("echo \"a\\\"b && c\"");
+        assert_eq!(segs.len(), 1, "{segs:?}");
+        assert_eq!(segs[0], "echo \"a\\\"b && c\"", "the text must survive intact");
+    }
+
+    #[test]
+    fn a_backslash_inside_single_quotes_escapes_nothing() {
+        // Single quotes are literal in a shell: a backslash there protects
+        // nothing, so the closing quote is still a closing quote.
+        let targets = redirect_targets("echo '\\' > out.txt");
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0].target, "out.txt");
+    }
+
+    #[test]
+    fn an_operator_pair_is_consumed_exactly_once() {
+        // `&&>` is `&&` followed by a redirect. Consuming one character too
+        // few leaves the second `&` in the next segment; one too many eats
+        // the character after it.
+        assert_eq!(split_segments("ls &&> out.txt"), ["ls", "> out.txt"]);
+        // A pipe with no space after it: the character following must reach
+        // the next segment rather than being swallowed as part of the operator.
+        assert_eq!(split_segments("ls |grep x"), ["ls", "grep x"]);
+        assert_eq!(split_segments("ls ||grep x"), ["ls", "grep x"]);
+    }
+
+    #[test]
+    fn a_segment_may_begin_with_a_backslash() {
+        // Nothing precedes the first character, and the escape arm's bound is
+        // the only thing keeping the index from running off the front of the
+        // input. `\> out.txt` writes a literal `>` and redirects nothing.
+        assert_eq!(redirect_targets("\\> out.txt").len(), 0);
+        assert_eq!(split_segments("\\> out.txt"), ["\\> out.txt"]);
+    }
+
+    #[test]
+    fn every_sink_spelling_is_a_sink() {
+        // Seven spellings share one `matches!` arm, and the mutation pass
+        // cannot see inside a macro: it generates no per-arm mutants, so a
+        // spelling dropped from this list would go unnoticed by the tool
+        // that checks the rest of this file. Hence the explicit walk.
+        for sink in [
+            "/dev/null",
+            "/dev/zero",
+            "/dev/stdout",
+            "/dev/stderr",
+            "/dev/tty",
+            "/dev/full",
+            "NUL",
+            "nul",
+            "/DEV/NULL",
+        ] {
+            assert!(
+                redirect_targets(&format!("echo x > {sink}")).is_empty(),
+                "{sink} destroys nothing and must not be an overwrite target"
+            );
+        }
+        // And a path that merely looks like one is still a file.
+        for real in ["/dev/null.bak", "/dev/nullify", "nulled.txt"] {
+            assert_eq!(
+                redirect_targets(&format!("echo x > {real}")).len(),
+                1,
+                "{real} is an ordinary file"
+            );
+        }
+    }
 }

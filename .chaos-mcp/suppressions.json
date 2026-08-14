@@ -135,6 +135,43 @@
         "reason": "equivalent: the arm's body is byte-identical to the `_` default arm (token.starts_with('-')), so deleting it changes no behaviour. It exists to document that PowerShell never uses a leading slash for switches",
         "fingerprint": "5b4c79689c91"
       }
+    ],
+    "src/shell.rs": [
+      {
+        "line": 59,
+        "mutator": "replace < with > in split_segments",
+        "addedAt": 1786737505742,
+        "reason": "equivalent: not consuming the second `|` is unobservable. The unconsumed character is handled by the same `|` arm on the next iteration, which flushes an empty buffer, and flush() drops empties. Both paths produce identical segments",
+        "fingerprint": "555f7e722b0a"
+      },
+      {
+        "line": 60,
+        "mutator": "replace += with *= in split_segments",
+        "addedAt": 1786737505742,
+        "reason": "equivalent: i *= 1 leaves i unchanged, which is the same as not consuming the second `|`, and an unconsumed `|` only flushes an empty buffer, which flush() drops",
+        "fingerprint": "0d1ba708993c"
+      },
+      {
+        "line": 135,
+        "mutator": "replace < with <= in redirect_targets",
+        "addedAt": 1786737505742,
+        "reason": "equivalent: the bound differs only at a trailing backslash (i + 1 == len). There the real guard falls to the default arm and the mutant skips one position; both then leave the loop with nothing pushed",
+        "fingerprint": "f6a2746dc86a"
+      },
+      {
+        "line": 135,
+        "mutator": "replace + with * in redirect_targets",
+        "addedAt": 1786737505742,
+        "reason": "equivalent: i * 1 < len is i < len, which is always true inside the loop, so the guard reduces to !in_single. It differs only at a trailing backslash, where both paths end the loop having pushed nothing",
+        "fingerprint": "f6a2746dc86a"
+      },
+      {
+        "line": 155,
+        "mutator": "replace + with * in redirect_targets",
+        "addedAt": 1786737505742,
+        "reason": "equivalent: i = j lands on the '&' itself, which the next iteration matches with the default arm and steps over, arriving at the same position as i = j + 1",
+        "fingerprint": "507d53aa5804"
+      }
     ]
   }
 }
