@@ -301,4 +301,12 @@ fn rollback_restores_nothing_unless_it_is_confirmed() {
         proj.join("doomed.txt").exists(),
         "the insured file must come back"
     );
+    // The mark is part of the assertion on purpose: "1 path(s) restored" is
+    // also a substring of "-1 path(s) restored", so a count that went the
+    // wrong way would read as correct.
+    assert!(
+        out.stdout.contains("✓ 1 path(s) restored"),
+        "the count is the report of what happened: {:?}",
+        out.stdout
+    );
 }
