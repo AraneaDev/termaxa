@@ -45,12 +45,16 @@ fn run_termaxa(
         cmd.env("PATH", format!("{}:{}", dir.display(), inherited));
     }
     let mut child = cmd.spawn().expect("the binary must be runnable");
-    child
+    // A command may answer without reading stdin at all: `rollback` with an
+    // unknown id refuses before it ever prompts. The child then exits while
+    // this write is in flight and the pipe closes under it, which is the
+    // child not needing what was offered rather than a failure of the test.
+    // The assertions below carry the signal either way.
+    let _ = child
         .stdin
         .take()
         .expect("stdin must be piped")
-        .write_all(stdin.as_bytes())
-        .expect("stdin must be writable");
+        .write_all(stdin.as_bytes());
     let out = child.wait_with_output().expect("the child must exit");
     Output {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),

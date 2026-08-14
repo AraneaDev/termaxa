@@ -154,12 +154,13 @@ fn hook(home: &Path, proj: &Path, session: &str, command: &str) {
         .stdout(Stdio::piped())
         .spawn()
         .expect("the binary must be runnable");
-    child
+    // See cli_surface.rs: a child that exits before reading closes the pipe,
+    // and that is its answer rather than a plumbing failure.
+    let _ = child
         .stdin
         .take()
         .expect("stdin must be piped")
-        .write_all(payload.as_bytes())
-        .expect("the payload must be writable");
+        .write_all(payload.as_bytes());
     child.wait().expect("the hook must exit");
 }
 

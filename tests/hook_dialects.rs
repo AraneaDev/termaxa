@@ -34,12 +34,14 @@ fn hook(home: &Path, cwd: &Path, payload: &serde_json::Value, env: &[(&str, &str
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().expect("the binary must be runnable");
-    child
+    // The hook reads its payload to EOF, but a build that fails earlier exits
+    // first and closes the pipe under this write. Let the assertions report
+    // that rather than an EPIPE from the plumbing.
+    let _ = child
         .stdin
         .take()
         .expect("stdin must be piped")
-        .write_all(payload.to_string().as_bytes())
-        .expect("the payload must be writable");
+        .write_all(payload.to_string().as_bytes());
     let out = child.wait_with_output().expect("the hook must exit");
     Out {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
