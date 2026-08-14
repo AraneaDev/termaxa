@@ -18,6 +18,22 @@
         "reason": "equivalent: the only input that separates > from >= is len == n, and there the guarded body drains 0..0, which is a no-op either way",
         "fingerprint": "bbeea8530188"
       }
+    ],
+    "src/fingerprint.rs": [
+      {
+        "line": 131,
+        "mutator": "replace ^ with | in sha256_hex",
+        "addedAt": 1786705435998,
+        "reason": "equivalent: SHA-256 `ch` is (e&f)^(!e&g), whose terms are masked by e and !e and so are disjoint \u2014 XOR and OR agree on every bit pattern (verified over all 8)",
+        "fingerprint": "fe05454fb5c0"
+      },
+      {
+        "line": 138,
+        "mutator": "replace ^ with | in sha256_hex",
+        "addedAt": 1786705435998,
+        "reason": "equivalent: SHA-256 `maj` is the majority function, identical in XOR and OR form \u2014 both single-operator swaps match maj on all 8 bit patterns under Rust's & > ^ > | precedence",
+        "fingerprint": "735600a52303"
+      }
     ]
   }
 }
