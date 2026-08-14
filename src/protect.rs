@@ -246,4 +246,47 @@ mod tests {
         assert_eq!(what("", "policy.yaml"), None);
         assert_eq!(what("", "settings.json"), None);
     }
+
+    #[test]
+    fn an_absolute_path_is_never_resolved_against_the_cwd() {
+        // The cwd here is itself protected, so joining it onto an absolute
+        // path would refuse a file that has nothing to do with the gate.
+        assert_eq!(what("/repo/.termaxa", "/other/notes.md"), None);
+        assert_eq!(what("C:\\repo\\.termaxa", "\\other\\notes.md"), None);
+        // A drive letter makes a path absolute just as a leading separator does.
+        assert_eq!(what("C:\\repo\\.termaxa", "D:\\other\\notes.md"), None);
+    }
+
+    #[test]
+    fn separator_noise_does_not_shift_the_parent_directory() {
+        // `.` and empty segments are dropped, or `.claude/./settings.json`
+        // reads as a file whose parent is `.` and walks straight through.
+        assert_eq!(
+            what("/repo", "/repo/.claude/./settings.json"),
+            Some("agent-hook-config")
+        );
+        assert_eq!(
+            what("/repo", "/repo/.claude//settings.json"),
+            Some("agent-hook-config")
+        );
+    }
+
+    #[test]
+    fn only_settings_json_under_dot_claude_is_control_plane() {
+        // Both halves of the filename test matter, and so does the directory:
+        // widen any one of them and ordinary project files start being refused.
+        assert_eq!(what("/repo", "/repo/config/settings.json"), None);
+        assert_eq!(what("/repo", "/repo/.claude/mcp.json"), None);
+        assert_eq!(what("/repo", "/repo/.claude/settings.yaml"), None);
+    }
+
+    #[test]
+    fn the_github_dialect_only_claims_its_own_hooks_file() {
+        // `.github/hooks/` is not wholesale off limits — one filename in it is.
+        assert_eq!(what("/repo", "/repo/.github/hooks/config.json"), None);
+        assert_eq!(
+            what("/repo", "/repo/.github/hooks/hooks.json"),
+            Some("agent-hook-config")
+        );
+    }
 }

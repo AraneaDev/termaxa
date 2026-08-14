@@ -288,9 +288,424 @@ Plan: 2 to add, 0 to change, 1 to destroy.
     }
 
     #[test]
+    fn a_resource_line_needs_both_halves_of_its_shape() {
+        // Plan output is full of `#` comments, and prose elsewhere says "will
+        // be" constantly. A resource line is the intersection, not either one.
+        let out = "\
+  # this is a note about the plan
+  Terraform will be reading state
+  # aws_instance.old will be destroyed
+
+Plan: 0 to add, 0 to change, 1 to destroy.
+";
+        let (_, _, _, resources) = parse_tf_plan(out).unwrap();
+        assert_eq!(resources, ["aws_instance.old will be destroyed"]);
+    }
+
+    #[test]
     fn no_changes_is_zeroes() {
         let (a, c, d, _) = parse_tf_plan("No changes. Your infrastructure matches.").unwrap();
         assert_eq!((a, c, d), (0, 0, 0));
+    }
+}
+
+/// The live push preview, against real repositories.
+///
+/// `git()` runs wherever the PROCESS is, so every test here moves into a
+/// purpose-built repo — which is also why they take `TestEnv` and its lock
+/// rather than a bare scratch tree.
+#[cfg(test)]
+mod push_preview_tests {
+    use super::*;
+
+    use crate::testutil::TestEnv;
+    use std::path::{Path, PathBuf};
+
+    fn git_run(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "user.email=tests@termaxa.invalid",
+                "-c",
+                "user.name=termaxa tests",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git must be available: the preview under test is git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn commit_files(dir: &Path, names: &[String], message: &str) {
+        for name in names {
+            std::fs::write(dir.join(name), format!("{message}\n")).expect("file must be writable");
+        }
+        git_run(dir, &["add", "-A"]);
+        git_run(dir, &["commit", "-q", "-m", message]);
+    }
+
+    fn commit_one(dir: &Path, name: &str, message: &str) {
+        commit_files(dir, &[name.to_string()], message);
+    }
+
+    /// A working copy with `origin` beside it, one commit pushed and upstream
+    /// tracking set — case 1 of the three the preview distinguishes.
+    fn repo_with_remote(env: &mut TestEnv) -> PathBuf {
+        let root = env.root().to_path_buf();
+        let remote = root.join("remote.git");
+        git_run(
+            &root,
+            &["init", "--bare", "-q", remote.to_str().expect("utf-8 path")],
+        );
+
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).expect("work dir must be creatable");
+        git_run(&work, &["init", "-q"]);
+        // Name the unborn branch rather than checking one out: `checkout -B`
+        // has no commit to stand on yet.
+        git_run(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git_run(
+            &work,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("utf-8 path"),
+            ],
+        );
+        commit_one(&work, "seed.txt", "seed");
+        git_run(&work, &["push", "-q", "-u", "origin", "main"]);
+        // A bare repo's HEAD still names whatever `init` defaulted to, so a
+        // clone of it would land on an unborn branch of that name instead of
+        // the one branch that exists.
+        git_run(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        env.chdir(&work);
+        work
+    }
+
+    /// Put a commit on the remote that the local branch does not have, so a
+    /// force push would destroy it.
+    fn advance_the_remote(root: &Path, remote: &Path) {
+        let other = root.join("other");
+        git_run(
+            root,
+            &[
+                "clone",
+                "-q",
+                remote.to_str().expect("utf-8 path"),
+                other.to_str().expect("utf-8 path"),
+            ],
+        );
+        commit_one(&other, "remote-only.txt", "only on the remote");
+        git_run(&other, &["push", "-q", "origin", "main"]);
+    }
+
+    fn preview_of(command: &str) -> Preview {
+        generate(command, None, true).expect("a live push preview should exist in a repo")
+    }
+
+    #[test]
+    fn a_branch_the_remote_has_never_seen_is_entirely_new() {
+        let mut env = TestEnv::new("preview-new-branch");
+        let work = repo_with_remote(&mut env);
+        git_run(&work, &["checkout", "-q", "-b", "feature/widgets"]);
+        commit_one(&work, "widget.txt", "widget");
+
+        let p = preview_of("git push origin feature/widgets");
+        assert_eq!(
+            p.summary, "new branch, 2 commit(s)",
+            "with no upstream and no origin/<branch>, everything is new"
+        );
+        assert!(p.title.contains("new remote branch"), "{}", p.title);
+    }
+
+    #[test]
+    fn nothing_to_push_is_said_plainly() {
+        let mut env = TestEnv::new("preview-current");
+        repo_with_remote(&mut env);
+
+        let p = preview_of("git push origin main");
+        assert_eq!(p.summary, "nothing to push");
+    }
+
+    #[test]
+    fn the_commit_list_is_capped_and_says_how_many_it_hid() {
+        let mut env = TestEnv::new("preview-ahead");
+        let work = repo_with_remote(&mut env);
+        for i in 0..7 {
+            commit_one(&work, &format!("f{i}.txt"), &format!("commit {i}"));
+        }
+
+        let p = preview_of("git push origin main");
+        assert!(
+            p.summary.starts_with("7 commit(s);"),
+            "the count leads the summary: {}",
+            p.summary
+        );
+        let listed = p.lines.iter().filter(|l| l.contains("commit ")).count();
+        assert_eq!(
+            listed, 5,
+            "five commits are listed, then a tally: {:?}",
+            p.lines
+        );
+        assert!(
+            p.lines.iter().any(|l| l.contains("... and 2 more")),
+            "the hidden ones are counted, not dropped: {:?}",
+            p.lines
+        );
+        assert!(
+            !p.summary.contains("LOSES"),
+            "an ordinary push loses nothing: {}",
+            p.summary
+        );
+        assert!(
+            !p.lines.iter().any(|l| l.contains("LOSE")),
+            "and says nothing about loss: {:?}",
+            p.lines
+        );
+    }
+
+    #[test]
+    fn a_forced_push_that_destroys_nothing_claims_no_losses() {
+        // The boundary the `> 0` guards sit on: forced, with a range to
+        // examine, but nothing on the remote to lose.
+        let mut env = TestEnv::new("preview-force-clean");
+        let work = repo_with_remote(&mut env);
+        commit_one(&work, "ahead.txt", "ahead");
+
+        let p = preview_of("git push -f origin main");
+        assert!(
+            !p.summary.contains("LOSES"),
+            "nothing is lost, so nothing is claimed: {}",
+            p.summary
+        );
+        assert!(!p.lines.iter().any(|l| l.contains("LOSE")), "{:?}", p.lines);
+    }
+
+    #[test]
+    fn a_forced_push_reports_what_the_remote_would_lose() {
+        // The v0.6.0 incident: the preview said "nothing to push" while a
+        // force push destroyed a commit. Gain and loss are different
+        // directions, and only the loss direction is the damage.
+        let mut env = TestEnv::new("preview-force-loss");
+        let work = repo_with_remote(&mut env);
+        let remote = env.root().join("remote.git");
+        advance_the_remote(env.root(), &remote);
+        git_run(&work, &["fetch", "-q", "origin"]);
+
+        // `-f` alone, not `--force`: both spellings must count as force.
+        let forced = preview_of("git push -f origin main");
+        assert!(
+            forced.summary.starts_with("remote LOSES 1 commit(s);"),
+            "the loss leads the summary: {}",
+            forced.summary
+        );
+        assert!(
+            forced
+                .lines
+                .iter()
+                .any(|l| l.contains("remote will LOSE 1 commit(s)")),
+            "and is spelled out in the body: {:?}",
+            forced.lines
+        );
+
+        // The same state without the force flag destroys nothing, so the
+        // preview must not borrow the forced reading.
+        let plain = preview_of("git push origin main");
+        assert_eq!(plain.summary, "nothing to push");
+    }
+
+    #[test]
+    fn the_file_list_is_capped_and_excludes_the_totals_line() {
+        let mut env = TestEnv::new("preview-files-many");
+        let work = repo_with_remote(&mut env);
+        let names: Vec<String> = (0..10).map(|i| format!("file{i:02}.txt")).collect();
+        commit_files(&work, &names, "ten files");
+
+        let p = preview_of("git push origin main");
+        assert!(
+            p.lines.iter().any(|l| l.contains("... and 2 more files")),
+            "ten files, eight shown: {:?}",
+            p.lines
+        );
+        // The last --stat line is the totals; it belongs in the summary, and
+        // listing it among the files would double-count it.
+        assert!(
+            !p.lines.iter().any(|l| l.contains("files changed")),
+            "the totals line is not a file: {:?}",
+            p.lines
+        );
+        assert!(
+            p.summary.contains("files changed"),
+            "the summary is where the totals go: {}",
+            p.summary
+        );
+    }
+
+    #[test]
+    fn a_short_file_list_still_stops_before_the_totals_line() {
+        // Under the cap of eight, the ONLY thing keeping the --stat totals
+        // line out of the file list is dropping the last entry. With ten
+        // files the cap hides that, and a list that ran one line too far
+        // would look correct.
+        let mut env = TestEnv::new("preview-files-few");
+        let work = repo_with_remote(&mut env);
+        let names: Vec<String> = (0..3).map(|i| format!("file{i}.txt")).collect();
+        commit_files(&work, &names, "three files");
+
+        let p = preview_of("git push origin main");
+        assert!(
+            !p.lines.iter().any(|l| l.contains("files changed")),
+            "the totals line is not one of the files: {:?}",
+            p.lines
+        );
+        let listed = p
+            .lines
+            .iter()
+            .filter(|l| l.contains(".txt") && l.contains('|'))
+            .count();
+        assert_eq!(listed, 3, "three files, three lines: {:?}", p.lines);
+    }
+
+    #[test]
+    fn exactly_eight_files_are_all_shown_without_a_tally() {
+        // The boundary: eight fit, so there is no "and N more" to add.
+        let mut env = TestEnv::new("preview-files-eight");
+        let work = repo_with_remote(&mut env);
+        let names: Vec<String> = (0..8).map(|i| format!("file{i}.txt")).collect();
+        commit_files(&work, &names, "eight files");
+
+        let p = preview_of("git push origin main");
+        assert!(
+            !p.lines.iter().any(|l| l.contains("more files")),
+            "nothing was hidden, so nothing is tallied: {:?}",
+            p.lines
+        );
+        let listed = p.lines.iter().filter(|l| l.contains("file")).count();
+        assert!(listed >= 8, "all eight are shown: {:?}", p.lines);
+    }
+}
+
+/// The terraform planner, driven by a stub binary.
+///
+/// Neither terraform nor tofu is a reasonable test dependency, and the plan
+/// output is the only thing this code reads — so a script that prints one is
+/// a complete stand-in. It is also how the live-gate finding below was
+/// originally confirmed.
+#[cfg(all(test, unix))]
+mod terraform_stub_tests {
+    use super::*;
+
+    use crate::testutil::{TempTree, TestEnv};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    const DESTROYS_ONE: &str = "  # aws_instance.old will be destroyed\n\
+                                \x20 # terraform_data.web will be created\n\
+                                Plan: 2 to add, 0 to change, 1 to destroy.";
+    const DESTROYS_NOTHING: &str = "  # terraform_data.web will be created\n\
+                                    Plan: 1 to add, 0 to change, 0 to destroy.";
+
+    /// A fake planner that prints `plan` and exits with `code`.
+    fn stub(dir: &Path, name: &str, plan: &str, code: i32) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("stub dir must be creatable");
+        let path = dir.join(name);
+        // printf rather than a heredoc through `cat`: `cat` is an external
+        // command, so the stub would depend on PATH resolving it, and PATH is
+        // exactly what the neighbouring test in this module rewrites while
+        // this one may be running. printf is a builtin and needs nothing
+        // found on disk.
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '%s\\n' \"{plan}\"\nexit {code}\n"),
+        )
+        .expect("stub must be writable");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("stub must be executable");
+        path
+    }
+
+    #[test]
+    fn a_plan_that_destroys_something_leads_with_the_destruction() {
+        let tmp = TempTree::new("tf-destroys");
+        let bin = stub(tmp.path(), "faketf", DESTROYS_ONE, 0);
+
+        let p = terraform_preview(bin.to_str().expect("utf-8 path"), true)
+            .expect("a successful plan is a preview");
+        assert_eq!(p.summary, "plan: +2 ~0 -1");
+        assert!(
+            p.lines
+                .iter()
+                .any(|l| l.contains("1 resource(s) will be DESTROYED")),
+            "{:?}",
+            p.lines
+        );
+    }
+
+    #[test]
+    fn a_plan_that_destroys_nothing_says_nothing_about_destruction() {
+        let tmp = TempTree::new("tf-safe");
+        let bin = stub(tmp.path(), "faketf", DESTROYS_NOTHING, 0);
+
+        let p = terraform_preview(bin.to_str().expect("utf-8 path"), false)
+            .expect("a successful plan is a preview");
+        assert_eq!(p.summary, "plan: +1 ~0 -0");
+        assert!(
+            !p.lines.iter().any(|l| l.contains("DESTROYED")),
+            "a warning about zero resources is noise: {:?}",
+            p.lines
+        );
+    }
+
+    #[test]
+    fn a_plan_that_failed_is_not_read_at_all() {
+        // Valid-looking output on a non-zero exit: an uninitialised directory
+        // prints plenty. Best effort means staying silent, not guessing.
+        let tmp = TempTree::new("tf-failed");
+        let bin = stub(tmp.path(), "faketf", DESTROYS_ONE, 1);
+
+        assert!(terraform_preview(bin.to_str().expect("utf-8 path"), false).is_none());
+    }
+
+    #[test]
+    fn both_apply_and_destroy_reach_the_planner() {
+        // PATH is process-global, so this takes the environment lock. The
+        // binary name is fixed in the source, which is why the stub has to be
+        // found the way the real one would be.
+        let env = TestEnv::new("tf-path");
+        let bin_dir = env.root().join("bin");
+        stub(&bin_dir, "terraform", DESTROYS_ONE, 0);
+
+        let previous = std::env::var_os("PATH");
+        let combined = match &previous {
+            Some(p) => format!("{}:{}", bin_dir.display(), p.to_string_lossy()),
+            None => bin_dir.display().to_string(),
+        };
+        std::env::set_var("PATH", combined);
+
+        // Both verbs are gated the same way; capture before restoring so a
+        // failing assertion cannot leave PATH rewritten for the whole process.
+        let apply = generate("terraform apply -auto-approve", None, true);
+        let destroy = generate("terraform destroy", None, true);
+
+        match previous {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert!(apply.is_some(), "`terraform apply` must be previewed");
+        assert!(destroy.is_some(), "`terraform destroy` must be previewed");
+        // `env` is still alive here, holding the lock across the restore.
+        drop(env);
     }
 }
 
@@ -326,6 +741,20 @@ mod live_gate_tests {
         assert!(
             p.summary.contains("users"),
             "denial reason lost its detail: {}",
+            p.summary
+        );
+    }
+
+    /// A compound command is previewed by the first segment that has an
+    /// answer, not by the whole string: `echo hi;psql -c "DROP TABLE users"`
+    /// is not a psql command, but half of it is.
+    #[test]
+    fn a_compound_command_is_previewed_by_its_first_meaningful_segment() {
+        let p = generate(r#"echo hi;psql -d shop -c "DROP TABLE users""#, None, false)
+            .expect("the segment carrying a preview must be found");
+        assert!(
+            p.summary.contains("users"),
+            "the segment's own analysis is what surfaces: {}",
             p.summary
         );
     }

@@ -112,3 +112,207 @@ fn current_git_branch() -> Option<String> {
         Some(branch)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::testutil::TestEnv;
+    use std::path::{Path, PathBuf};
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git must be available: branch awareness is what is under test");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A repo with one commit, sitting on `branch`, with the process moved
+    /// into it — `current_git_branch` reads the cwd, so the branch has to be
+    /// real rather than mocked.
+    fn repo_on_branch(env: &mut TestEnv, branch: &str) -> PathBuf {
+        let dir = env.root().join("repo");
+        std::fs::create_dir_all(&dir).expect("repo dir must be creatable");
+        git(&dir, &["init", "-q"]);
+        git(
+            &dir,
+            &[
+                "-c",
+                "user.email=tests@termaxa.invalid",
+                "-c",
+                "user.name=termaxa tests",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "root",
+            ],
+        );
+        git(&dir, &["checkout", "-q", "-B", branch]);
+        env.chdir(&dir);
+        dir
+    }
+
+    fn branch_signal(signals: &[Signal]) -> Signal {
+        signals
+            .iter()
+            .find(|s| s.label.starts_with("current branch:"))
+            .cloned()
+            .expect("a git command in a repo should report the branch it is on")
+    }
+
+    #[test]
+    fn committing_reports_the_branch_without_escalating() {
+        let mut env = TestEnv::new("ctx-commit");
+        repo_on_branch(&mut env, "main");
+
+        let signal = branch_signal(&gather("git commit -m wip"));
+        assert_eq!(signal.label, "current branch: main");
+        // Being on main is worth showing; a commit is local and reversible,
+        // so it is not worth stopping for.
+        assert!(!signal.escalate, "a commit on main must not escalate");
+    }
+
+    #[test]
+    fn pushing_to_a_protected_branch_escalates() {
+        let mut env = TestEnv::new("ctx-push-main");
+        repo_on_branch(&mut env, "main");
+
+        let signal = branch_signal(&gather("git push origin main"));
+        assert_eq!(signal.label, "current branch: main");
+        assert!(
+            signal.escalate,
+            "a push to main is the case this exists for"
+        );
+    }
+
+    #[test]
+    fn pushing_from_a_feature_branch_does_not_escalate() {
+        let mut env = TestEnv::new("ctx-push-feature");
+        repo_on_branch(&mut env, "feature/widgets");
+
+        let signal = branch_signal(&gather("git push origin feature/widgets"));
+        assert_eq!(signal.label, "current branch: feature/widgets");
+        assert!(
+            !signal.escalate,
+            "only the protected branches make a push notable"
+        );
+    }
+
+    #[test]
+    fn a_production_marker_is_flagged_on_a_non_git_command() {
+        let signals = gather("psql -h prod-db.internal -c 'select 1'");
+        let prod = signals
+            .iter()
+            .find(|s| s.label.contains("possible production target"))
+            .expect("`prod` in a connection string is the whole point of this check");
+        assert!(prod.escalate);
+    }
+
+    #[test]
+    fn git_commands_are_exempt_from_the_production_marker() {
+        // Branch and remote names carry `production` constantly; flagging
+        // every one of them would train the human to click through.
+        let signals = gather("git push origin production");
+        assert!(
+            !signals
+                .iter()
+                .any(|s| s.label.contains("possible production target")),
+            "a git ref named production is not a production target"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_command_produces_no_signals_at_all() {
+        assert!(
+            gather("ls -la").is_empty(),
+            "a listing is not worth a signal"
+        );
+    }
+
+    #[test]
+    fn destructive_sql_and_flags_are_flagged() {
+        let signals = gather("psql -c \"TRUNCATE users\"");
+        assert!(signals
+            .iter()
+            .any(|s| s.label.contains("destructive SQL") && s.escalate));
+
+        let signals = gather("rm -rf build");
+        assert!(signals
+            .iter()
+            .any(|s| s.label.contains("destructive flag") && s.escalate));
+    }
+
+    #[test]
+    fn command_substitution_is_flagged_because_it_cannot_be_read() {
+        let signals = gather("echo $(cat /etc/passwd)");
+        assert!(signals
+            .iter()
+            .any(|s| s.label.contains("command substitution") && s.escalate));
+    }
+
+    fn decision(action: Action) -> Decision {
+        Decision {
+            action,
+            matched_rule: Some("rule".into()),
+            reason: "base".into(),
+        }
+    }
+
+    fn escalating() -> Vec<Signal> {
+        vec![Signal {
+            label: "destructive flag detected: --force".into(),
+            escalate: true,
+        }]
+    }
+
+    #[test]
+    fn context_escalates_allow_to_ask_and_says_why() {
+        let (out, escalated) = apply(decision(Action::Allow), &escalating());
+        assert_eq!(out.action, Action::Ask);
+        assert!(escalated);
+        assert!(
+            out.reason.contains("base") && out.reason.contains("--force"),
+            "the reason must keep the rule's own words and add the signal: {}",
+            out.reason
+        );
+        assert_eq!(
+            out.matched_rule,
+            Some("rule".into()),
+            "escalation does not change which rule matched"
+        );
+    }
+
+    #[test]
+    fn context_never_downgrades_a_decision() {
+        // A deny that a signal could soften would be a gate with a bypass.
+        let (out, escalated) = apply(decision(Action::Deny), &escalating());
+        assert_eq!(out.action, Action::Deny);
+        assert!(!escalated);
+
+        let (out, escalated) = apply(decision(Action::Ask), &escalating());
+        assert_eq!(out.action, Action::Ask);
+        assert!(!escalated);
+    }
+
+    #[test]
+    fn a_non_escalating_signal_leaves_allow_alone() {
+        let noted = vec![Signal {
+            label: "current branch: main".into(),
+            escalate: false,
+        }];
+        let (out, escalated) = apply(decision(Action::Allow), &noted);
+        assert_eq!(out.action, Action::Allow);
+        assert!(!escalated);
+        assert_eq!(out.reason, "base", "an untouched decision keeps its reason");
+    }
+}

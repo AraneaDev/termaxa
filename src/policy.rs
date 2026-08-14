@@ -323,6 +323,150 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
 }
 
 #[cfg(test)]
+mod schema_and_severity_tests {
+    use super::*;
+
+    fn policy_from(yaml: &str) -> Policy {
+        serde_yaml::from_str(yaml).expect("policy must parse")
+    }
+
+    #[test]
+    fn an_omitted_field_gets_the_documented_default() {
+        let minimal = policy_from("default: ask\nrules: []\n");
+        assert_eq!(minimal.version, 1, "version 1 is the current schema");
+
+        let notifying = policy_from(
+            "default: ask\nrules: []\nnotify:\n  webhook: https://example.invalid/hook\n",
+        );
+        assert_eq!(
+            notifying.notify.expect("the notify block must parse").on,
+            ["deny"],
+            "notifying on every decision trains the reader to ignore them"
+        );
+    }
+
+    #[test]
+    fn case_sensitivity_is_written_out_only_when_it_was_asked_for() {
+        let plain = Rule {
+            r#match: "ls*".into(),
+            action: Action::Allow,
+            reason: None,
+            case_sensitive: false,
+        };
+        let json = serde_json::to_string(&plain).expect("a rule must serialize");
+        assert!(
+            !json.contains("case_sensitive"),
+            "the default must not clutter every rule: {json}"
+        );
+
+        let strict = Rule {
+            r#match: "git branch -D*".into(),
+            action: Action::Deny,
+            reason: None,
+            case_sensitive: true,
+        };
+        let json = serde_json::to_string(&strict).expect("a rule must serialize");
+        assert!(
+            json.contains("case_sensitive"),
+            "an opt-in has to survive the round trip: {json}"
+        );
+    }
+
+    #[test]
+    fn the_readings_include_the_tokenized_form_a_quote_would_hide() {
+        let views = readings(r#""rm" -rf /"#);
+        assert!(
+            views.contains(&r#""rm" -rf /"#.to_string()),
+            "the raw reading is still there: {views:?}"
+        );
+        assert!(
+            views.contains(&"rm -rf /".to_string()),
+            "quotes must not hide a command from its rule: {views:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_command_is_not_read_twice() {
+        // Nothing to strip and nothing to lower: one reading is enough, and a
+        // duplicate would just be work.
+        assert_eq!(readings("git status"), ["git status"]);
+    }
+
+    #[test]
+    fn the_earliest_of_two_equally_severe_rules_is_the_one_reported() {
+        // The quoted spelling matches rule 1; the tokenized reading matches
+        // rule 2. Same severity, so first-match-wins has to survive there
+        // being several readings.
+        let p = policy_from(
+            "default: allow\nrules:\n  - match: '\"rm\"*'\n    action: deny\n  \
+             - match: \"rm -rf*\"\n    action: deny\n",
+        );
+        let d = p.evaluate(r#""rm" -rf /"#);
+        assert_eq!(d.action, Action::Deny);
+        assert_eq!(d.matched_rule.as_deref(), Some("\"rm\"*"));
+    }
+
+    #[test]
+    fn the_earliest_rule_still_wins_when_the_order_is_reversed() {
+        // The mirror image, so "earliest" cannot be satisfied by accident of
+        // which reading happens to be examined first.
+        let p = policy_from(
+            "default: allow\nrules:\n  - match: \"rm -rf*\"\n    action: deny\n  \
+             - match: '\"rm\"*'\n    action: deny\n",
+        );
+        let d = p.evaluate(r#""rm" -rf /"#);
+        assert_eq!(d.matched_rule.as_deref(), Some("rm -rf*"));
+    }
+
+    #[test]
+    fn a_spelling_only_one_reading_recognises_gets_the_worse_verdict() {
+        // The documented cost of severity-across-readings: the raw reading
+        // matches the allow, the tokenized reading matches the deny, and the
+        // deny governs. This case fails CLOSED on purpose.
+        let p = policy_from(
+            "default: allow\nrules:\n  - match: '\"cat\"*'\n    action: allow\n  \
+             - match: \"cat .termaxa*\"\n    action: deny\n",
+        );
+        let d = p.evaluate(r#""cat" .termaxa/policy.yaml"#);
+        assert_eq!(
+            d.action,
+            Action::Deny,
+            "a spelling only some readings recognise must not reach the exception: {}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn the_first_of_two_equally_dangerous_segments_is_the_one_named() {
+        // Naming the later one would point the reader at the second-worst
+        // thing in the command.
+        let p = policy_from(
+            "default: allow\nrules:\n  - match: \"rm -rf*\"\n    action: deny\n  \
+             - match: \"drop table*\"\n    action: deny\n",
+        );
+        let d = p.evaluate_command("rm -rf /tmp/x && drop table users");
+        assert_eq!(d.action, Action::Deny);
+        assert_eq!(d.matched_rule.as_deref(), Some("rm -rf*"));
+        assert!(d.reason.contains("segment 1/2"), "{}", d.reason);
+    }
+
+    #[test]
+    fn an_explicit_allow_never_outranks_a_more_dangerous_default() {
+        // Segment 1 falls through to the `ask` default; segment 2 matches an
+        // explicit allow. A matched rule breaks TIES between equally severe
+        // segments — it does not lower the verdict.
+        let p = policy_from("default: ask\nrules:\n  - match: \"ls*\"\n    action: allow\n");
+        let d = p.evaluate_command("curl https://example.invalid/x | ls");
+        assert_eq!(
+            d.action,
+            Action::Ask,
+            "the most dangerous segment governs: {}",
+            d.reason
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

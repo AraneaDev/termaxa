@@ -716,4 +716,348 @@ mod tests {
         );
         assert_eq!(psql_program(&shell_tokens("evilpsql -c 'x'")), None);
     }
+
+    use crate::testutil::TempTree;
+
+    // -----------------------------------------------------------------------
+    // The grammar, at the places it decides how much is destroyed.
+    // -----------------------------------------------------------------------
+
+    fn truncate_of(sql: &str) -> (Vec<String>, bool) {
+        match parse_destructive(sql).into_iter().next() {
+            Some(Destructive::Truncate { tables, cascade }) => (tables, cascade),
+            other => panic!("expected a TRUNCATE, got {other:?} for {sql:?}"),
+        }
+    }
+
+    #[test]
+    fn a_table_list_ends_at_cascade_rather_than_swallowing_it() {
+        // CASCADE is a modifier, not a table. Reading it as one both invents a
+        // table and loses the fact that dependents will be emptied too.
+        let (tables, cascade) = truncate_of("TRUNCATE users CASCADE");
+        assert_eq!(tables, ["users"]);
+        assert!(cascade);
+
+        let (tables, cascade) = truncate_of("TRUNCATE users RESTRICT");
+        assert_eq!(tables, ["users"]);
+        assert!(!cascade, "RESTRICT is the opposite of CASCADE");
+    }
+
+    #[test]
+    fn a_comma_separated_list_is_read_in_either_spelling() {
+        for sql in ["TRUNCATE a, b", "TRUNCATE a , b", "TRUNCATE TABLE a, b"] {
+            let (tables, _) = truncate_of(sql);
+            assert_eq!(tables, ["a", "b"], "{sql}");
+        }
+        // A trailing comma runs the list to the very end of the statement,
+        // which is where the loop bound is the only thing left to stop it.
+        let (tables, _) = truncate_of("TRUNCATE a, b,");
+        assert_eq!(tables, ["a", "b"]);
+    }
+
+    /// KNOWN GAP, pinned so a fix flips it deliberately rather than by
+    /// accident. A comma with no space after it is valid SQL and this parser
+    /// does not read it: `clean_ident` refuses `a,b` because the comma is
+    /// interior rather than trailing, so the table list comes back empty and
+    /// the statement is classified as nothing.
+    ///
+    /// The consequence is not a missing preview. `backup::pg_backup_targets`
+    /// reads the same parse, so the command runs with NO pg_dump behind it:
+    ///
+    ///   TRUNCATE a, b   parsed, insurance planned
+    ///   TRUNCATE a,b    not parsed, NO insurance
+    ///
+    /// The intent classifier still sees it (it matches on the text), so policy
+    /// and the breaker still gate the command. It is only the safety net that
+    /// is decided by whitespace, which is the same class as the v0.14 path bug
+    /// in delete.rs: "path syntax must never decide whether a safety net
+    /// exists". Here it is comma spacing.
+    #[test]
+    fn a_comma_without_a_space_is_a_known_gap_with_no_insurance_beneath() {
+        assert!(
+            parse_destructive("TRUNCATE a,b").is_empty(),
+            "if this starts parsing, the gap closed and this test should be \
+             inverted rather than deleted"
+        );
+        assert!(parse_destructive("DROP TABLE a,b").is_empty());
+
+        // The spaced spelling of the same statement is read in full, which is
+        // what makes the difference a spelling rather than a limitation.
+        assert_eq!(truncate_of("TRUNCATE a, b").0, ["a", "b"]);
+    }
+
+    #[test]
+    fn only_is_stepped_over_rather_than_taken_as_the_table() {
+        let (tables, _) = truncate_of("TRUNCATE ONLY users");
+        assert_eq!(tables, ["users"]);
+
+        match parse_destructive("DELETE FROM ONLY users")
+            .into_iter()
+            .next()
+        {
+            Some(Destructive::DeleteFrom { table, has_where }) => {
+                assert_eq!(table, "users");
+                assert!(!has_where);
+            }
+            other => panic!("expected a DELETE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_needs_both_of_its_keywords() {
+        // `DELETE ONLY users` is not a statement postgres accepts, and
+        // classifying it would be inventing a destruction that cannot happen.
+        assert!(parse_destructive("DELETE ONLY users").is_empty());
+        assert!(parse_destructive("FROM users").is_empty());
+    }
+
+    #[test]
+    fn a_malformed_if_exists_does_not_make_a_drop_invisible() {
+        // Both halves have to be present for the clause to be consumed. If
+        // only `IF` is checked, the parser steps past two words that are not
+        // there and loses the table list, and a DROP goes unclassified.
+        let found = parse_destructive("DROP TABLE IF users");
+        assert!(
+            !found.is_empty(),
+            "a DROP with a broken IF EXISTS is still a DROP"
+        );
+    }
+
+    #[test]
+    fn an_identifier_may_be_schema_qualified_or_carry_the_allowed_symbols() {
+        for (sql, want) in [
+            ("TRUNCATE public.users", "public.users"),
+            ("TRUNCATE _private", "_private"),
+            ("TRUNCATE tab$le", "tab$le"),
+            ("TRUNCATE \"users\"", "users"),
+        ] {
+            let (tables, _) = truncate_of(sql);
+            assert_eq!(tables, [want], "{sql}");
+        }
+        // And junk is refused rather than guessed at.
+        assert!(parse_destructive("TRUNCATE (select 1)").is_empty());
+    }
+
+    #[test]
+    fn the_tokenizer_keeps_each_quote_kind_to_itself() {
+        // A `"` inside single quotes is data, and a `'` inside double quotes
+        // is data. Reading either as a delimiter re-splits the SQL that
+        // follows it, and the statement the gate examines stops being the
+        // statement that will run.
+        assert_eq!(
+            shell_tokens("psql -c 'it\"s fine'"),
+            ["psql", "-c", "it\"s fine"]
+        );
+        assert_eq!(
+            shell_tokens("psql -c \"it's fine\""),
+            ["psql", "-c", "it's fine"]
+        );
+    }
+
+    #[test]
+    fn a_backslash_escapes_only_inside_double_quotes() {
+        // Inside double quotes it protects the next character, so the string
+        // does not end early. Outside them psql sees a literal backslash, and
+        // consuming the next character there would drop it from the command.
+        assert_eq!(
+            shell_tokens("psql -c \"a\\\"b\""),
+            ["psql", "-c", "a\"b"],
+            "the escaped quote belongs to the string, not to its end"
+        );
+        assert_eq!(shell_tokens("psql a\\b"), ["psql", "a\\b"]);
+    }
+
+    #[test]
+    fn a_psql_invocation_without_a_statement_has_nothing_to_preview() {
+        // extract_sql walks to the end of the token list here, and the bound
+        // on that walk is all that separates it from an index panic.
+        assert!(preview_for("psql -d shop", false).is_none());
+        assert!(preview_for("psql -d shop -U app -tAX", false).is_none());
+    }
+
+    #[test]
+    fn every_connection_parameter_survives_the_rebuild() {
+        // The argv is rebuilt from an allowlist rather than filtered, so a
+        // parameter missing from that list is one the preview silently
+        // connects without: a port dropped here sends the catalog query to
+        // 5432 and reports on whichever database answers there.
+        let args = connection_args(&shell_tokens(
+            "psql -h db.internal -p 5433 -U app -d shop -c \"TRUNCATE users\"",
+        ));
+        for pair in [
+            ["-h", "db.internal"],
+            ["-p", "5433"],
+            ["-U", "app"],
+            ["-d", "shop"],
+        ] {
+            assert!(
+                args.windows(2).any(|w| w == pair),
+                "{pair:?} must survive: {args:?}"
+            );
+        }
+        // And the statement itself must not.
+        assert!(!args.iter().any(|a| a.contains("TRUNCATE")), "{args:?}");
+    }
+
+    #[test]
+    fn a_lone_dash_is_a_positional_not_a_flag_cluster() {
+        // `-` on its own carries no flag letters. Treating it as a cluster
+        // would silently drop it instead of letting it fall through to the
+        // positional handling psql itself applies.
+        let args = connection_args(&shell_tokens("psql -"));
+        assert!(args.windows(2).any(|w| w == ["-d", "-"]), "{args:?}");
+    }
+
+    #[test]
+    fn a_table_list_that_reaches_cascade_after_a_comma_still_stops() {
+        // The comma keeps the list open, so CASCADE arrives at the top of the
+        // loop rather than at its tail. It is a modifier either way.
+        let (tables, cascade) = truncate_of("TRUNCATE a, CASCADE");
+        assert_eq!(tables, ["a"]);
+        assert!(cascade);
+    }
+
+    #[test]
+    fn two_tables_without_a_comma_are_not_a_list() {
+        // `TRUNCATE a b` is not valid SQL, and reading it as two tables would
+        // mean insuring, previewing and reporting a table nobody named.
+        let (tables, _) = truncate_of("TRUNCATE a b");
+        assert_eq!(tables, ["a"]);
+    }
+
+    #[test]
+    fn thousands_are_grouped_at_every_boundary() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1000), "1,000");
+        assert_eq!(group_thousands(100), "100");
+        assert_eq!(group_thousands(1234567), "1,234,567");
+        assert_eq!(group_thousands(-1000), "-1,000");
+    }
+
+    #[test]
+    fn a_row_count_that_was_never_analyzed_says_so() {
+        // -1 is postgres saying "I have never counted", which is a different
+        // fact from zero rows and must not be printed as one.
+        let unknown = TableInfo {
+            rows: -1,
+            dependents: vec![],
+        };
+        assert_eq!(unknown.rows_display(), "unknown (never analyzed)");
+
+        let counted = TableInfo {
+            rows: 0,
+            dependents: vec![],
+        };
+        assert_eq!(counted.rows_display(), "0");
+    }
+
+    // -----------------------------------------------------------------------
+    // Introspection, against a stub psql.
+    //
+    // The stub is reached by ABSOLUTE PATH, taken from the command itself, so
+    // nothing here touches the process environment: psql_program accepts any
+    // path whose file stem is psql.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    fn stub_psql(dir: &std::path::Path, body: &str, code: i32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("psql");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '%s\\n' \"{body}\"\nexit {code}\n"),
+        )
+        .expect("stub must be writable");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("stub must be executable");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn introspection_reads_the_row_count_and_the_dependents() {
+        let tmp = TempTree::new("pg-introspect");
+        // SET lines and blanks are noise from the session setup, not data.
+        let psql = stub_psql(tmp.path(), "SET\n\n120000\norders,invoices\n", 0);
+        let command = format!("{} -d shop -c \"TRUNCATE users\"", psql.display());
+
+        assert_eq!(
+            fk_dependents(&command, "users"),
+            ["orders", "invoices"],
+            "the dependents decide what a CASCADE would also empty"
+        );
+
+        let p = preview_for(&command, true).expect("a truncate is previewable");
+        assert!(
+            p.lines.iter().any(|l| l.contains("120,000")),
+            "the row estimate is the blast radius: {:?}",
+            p.lines
+        );
+        assert!(
+            p.lines
+                .iter()
+                .any(|l| l.contains("without CASCADE") && l.contains("orders")),
+            "a truncate with dependents and no CASCADE will fail, and saying so \
+             is the difference between a preview and a guess: {:?}",
+            p.lines
+        );
+        assert!(
+            !p.lines.iter().any(|l| l.contains("database unreachable")),
+            "the database answered: {:?}",
+            p.lines
+        );
+
+        // With CASCADE the dependents are emptied on purpose, so the warning
+        // that the statement will FAIL without it must not appear.
+        let with_cascade = format!("{} -d shop -c \"TRUNCATE users CASCADE\"", psql.display());
+        let p = preview_for(&with_cascade, true).expect("a truncate is previewable");
+        assert!(
+            !p.lines.iter().any(|l| l.contains("without CASCADE")),
+            "CASCADE was given: {:?}",
+            p.lines
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_dependent_list_is_not_a_dependent() {
+        let tmp = TempTree::new("pg-deps");
+        let psql = stub_psql(tmp.path(), "SET\n7\norders,,invoices\n", 0);
+        let command = format!("{} -d shop -c \"TRUNCATE users\"", psql.display());
+
+        assert_eq!(fk_dependents(&command, "users"), ["orders", "invoices"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_database_that_refuses_degrades_to_static_analysis() {
+        // Wrong table, no permission, database down: all the same answer, and
+        // it must be a quieter preview rather than a missing one.
+        let tmp = TempTree::new("pg-refused");
+        let psql = stub_psql(tmp.path(), "FATAL: no", 1);
+        let command = format!("{} -d shop -c \"TRUNCATE users\"", psql.display());
+
+        assert!(fk_dependents(&command, "users").is_empty());
+
+        let p = preview_for(&command, true).expect("static analysis still applies");
+        assert!(
+            p.lines.iter().any(|l| l.contains("database unreachable")),
+            "{:?}",
+            p.lines
+        );
+        assert!(
+            p.lines.iter().any(|l| l.contains("TRUNCATE users")),
+            "{:?}",
+            p.lines
+        );
+    }
+
+    #[test]
+    fn a_client_that_is_not_psql_is_not_previewed() {
+        assert!(preview_for("mysql -e \"DROP TABLE users\"", false).is_none());
+        assert!(preview_for("psqlx -c \"DROP TABLE users\"", false).is_none());
+        // An absolute path to the real client still is one.
+        assert!(preview_for("/usr/bin/psql -c \"DROP TABLE users\"", false).is_some());
+    }
 }

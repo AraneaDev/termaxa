@@ -143,3 +143,119 @@ fn execute(argv: &[String]) -> Result<i32> {
     let status = Command::new(&argv[0]).args(&argv[1..]).status()?;
     Ok(status.code().unwrap_or(1))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::testutil::TempTree;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// A project whose policy gives every command the same verdict.
+    fn project_with_default(tmp: &TempTree, default: &str) -> crate::paths::Paths {
+        let project_dir = tmp.dir("proj/.termaxa");
+        std::fs::write(
+            project_dir.join("policy.yaml"),
+            format!("version: 1\ndefault: {}\nrules: []\n", default),
+        )
+        .expect("policy must be writable");
+        crate::paths::Paths {
+            project_dir,
+            state_dir: tmp.dir("state"),
+        }
+    }
+
+    #[test]
+    fn shell_join_leaves_ordinary_arguments_alone() {
+        // Nothing here carries structure, so nothing should gain quotes —
+        // the reconstruction is what rules are matched against.
+        assert_eq!(shell_join(&argv(&["git", "status"])), "git status");
+    }
+
+    #[test]
+    fn shell_join_keeps_a_quoted_argument_in_one_piece() {
+        // The v0.6 failure this function exists for: `-c "TRUNCATE users"`
+        // flattened into three words, so the backup layer never saw a
+        // truncate worth insuring.
+        assert_eq!(
+            shell_join(&argv(&["psql", "-c", "TRUNCATE users"])),
+            "psql -c \"TRUNCATE users\""
+        );
+    }
+
+    #[test]
+    fn shell_join_quotes_an_empty_argument() {
+        // An empty argument is a token too; unquoted it vanishes from the
+        // string entirely and `sh -c ""` reads as a bare `sh -c`.
+        assert_eq!(shell_join(&argv(&["sh", "-c", ""])), "sh -c \"\"");
+    }
+
+    #[test]
+    fn shell_join_quotes_on_a_quote_character_without_whitespace() {
+        assert_eq!(shell_join(&argv(&["say", "it's"])), "say \"it's\"");
+        assert_eq!(shell_join(&argv(&["say", "a\"b"])), "say \"a\\\"b\"");
+    }
+
+    #[test]
+    fn shell_join_escapes_backslashes_before_quoting() {
+        // Backslashes go first, or the escape added for `"` gets escaped in
+        // turn and the quoting closes early.
+        assert_eq!(
+            shell_join(&argv(&["cat", "C:\\tmp dir\\x"])),
+            "cat \"C:\\\\tmp dir\\\\x\""
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_returns_the_child_exit_code() {
+        // 7 on purpose: none of 0, 1 or -1, so a body that reports a fixed
+        // code instead of the child's cannot pass.
+        assert_eq!(execute(&argv(&["sh", "-c", "exit 7"])).unwrap(), 7);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn execute_returns_the_child_exit_code() {
+        assert_eq!(execute(&argv(&["cmd", "/C", "exit 7"])).unwrap(), 7);
+    }
+
+    #[test]
+    fn execute_reports_an_unlaunchable_command_as_an_error() {
+        // Spawn failure must surface, not read as a successful exit 0.
+        assert!(execute(&argv(&["termaxa-no-such-binary-xyzzy"])).is_err());
+    }
+
+    #[test]
+    fn run_refuses_an_empty_command_line() {
+        let tmp = TempTree::new("runner-empty");
+        let paths = project_with_default(&tmp, "allow");
+
+        let err = run(&paths, &[]).expect_err("there is nothing to gate or execute");
+        assert!(
+            err.to_string().contains("nothing to run"),
+            "the error should say what was missing, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn run_blocks_a_denied_command_and_records_the_decision() {
+        let tmp = TempTree::new("runner-deny");
+        let paths = project_with_default(&tmp, "deny");
+
+        let code = run(&paths, &argv(&["echo", "hello"])).expect("a block is not an error");
+        assert_eq!(code, 1, "a blocked command must not report success");
+
+        let log = std::fs::read_to_string(paths.log_file())
+            .expect("every decision is logged, including the ones that ran nothing");
+        assert!(log.contains("\"decision\":\"deny\""), "{}", log);
+        assert!(log.contains("\"command\":\"echo hello\""), "{}", log);
+        // Nothing was launched, so there is no child exit code to report.
+        assert!(log.contains("\"exit_code\":null"), "{}", log);
+        assert!(log.contains("\"approved\":false"), "{}", log);
+    }
+}

@@ -611,4 +611,420 @@ mod tests {
         // not produce a plan merely because a switch was present.
         assert!(plan("del /s /q C:\\definitely-not-here-xyz-9f2").is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // What the command says: the parsing that decides whether insurance
+    // applies at all, and to what.
+    // -----------------------------------------------------------------------
+
+    use crate::testutil::TestEnv;
+
+    fn tokens_of(command: &str) -> Vec<String> {
+        crate::pg::shell_tokens(command)
+    }
+
+    #[test]
+    fn a_forced_push_names_the_ref_it_would_overwrite() {
+        assert_eq!(
+            git_force_push_target(&tokens_of("git push --force origin main")),
+            Some(("origin".to_string(), "main".to_string()))
+        );
+        // Flags are not positional arguments: reading them as one would pin
+        // `--force-with-lease` instead of the branch about to be lost.
+        assert_eq!(
+            git_force_push_target(&tokens_of("git push origin main --force-with-lease")),
+            Some(("origin".to_string(), "main".to_string()))
+        );
+    }
+
+    #[test]
+    fn every_spelling_of_force_counts_and_an_ordinary_push_does_not() {
+        for flag in ["--force", "-f", "--force-with-lease"] {
+            assert!(
+                git_force_push_target(&tokens_of(&format!("git push {flag} origin main")))
+                    .is_some(),
+                "{flag} is a force push"
+            );
+        }
+        // An ordinary push only adds commits; there is nothing to insure.
+        assert_eq!(
+            git_force_push_target(&tokens_of("git push origin main")),
+            None
+        );
+    }
+
+    #[test]
+    fn only_git_push_itself_is_a_forced_push() {
+        assert_eq!(
+            git_force_push_target(&tokens_of("git commit --force")),
+            None
+        );
+        assert_eq!(
+            git_force_push_target(&tokens_of("hub push --force origin main")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_truncate_is_insured_with_data_only_and_a_drop_with_the_schema() {
+        let (tables, data_only) = pg_backup_targets(r#"psql -d shop -c "TRUNCATE users""#)
+            .expect("a truncate is insurable");
+        assert_eq!(tables, ["users"]);
+        assert!(data_only, "the table survives a truncate; only its rows go");
+
+        let (tables, data_only) = pg_backup_targets(r#"psql -d shop -c "DROP TABLE users""#)
+            .expect("a drop is insurable");
+        assert_eq!(tables, ["users"]);
+        assert!(
+            !data_only,
+            "a drop takes the table itself, so the schema has to be in the dump"
+        );
+    }
+
+    #[test]
+    fn insurance_needs_a_psql_command_carrying_a_destructive_statement() {
+        assert!(
+            pg_backup_targets(r#"mysql -e "DROP TABLE users""#).is_none(),
+            "another client is not psql"
+        );
+        assert!(
+            pg_backup_targets("psql -d shop").is_none(),
+            "no statement, nothing to insure against"
+        );
+        assert!(
+            pg_backup_targets(r#"psql -d shop -c "SELECT 1""#).is_none(),
+            "a read destroys nothing"
+        );
+        assert!(
+            pg_backup_targets(r#"psql -d shop --command "TRUNCATE users""#).is_some(),
+            "the long spelling is the same flag"
+        );
+    }
+
+    #[test]
+    fn local_terraform_state_is_insured_only_for_apply_and_destroy() {
+        let mut env = TestEnv::new("bk-tfstate");
+        let stack = env.root().join("stack");
+        std::fs::create_dir_all(&stack).expect("stack dir must be creatable");
+        std::fs::write(stack.join("terraform.tfstate"), "{}").expect("state must be writable");
+        env.chdir(&stack);
+
+        for bin in ["terraform", "tofu"] {
+            for verb in ["apply", "destroy"] {
+                assert!(
+                    tf_state_target(&tokens_of(&format!("{bin} {verb}"))).is_some(),
+                    "{bin} {verb} rewrites state"
+                );
+            }
+            assert_eq!(
+                tf_state_target(&tokens_of(&format!("{bin} plan"))),
+                None,
+                "a plan changes nothing"
+            );
+        }
+        assert_eq!(
+            tf_state_target(&tokens_of("ansible apply")),
+            None,
+            "another tool's apply is not terraform's"
+        );
+
+        // Remote state is versioned by its own backend and out of scope: with
+        // no local file there is nothing here to copy.
+        let empty = env.root().join("remote-backend");
+        std::fs::create_dir_all(&empty).expect("dir must be creatable");
+        env.chdir(&empty);
+        assert_eq!(tf_state_target(&tokens_of("terraform destroy")), None);
+    }
+
+    #[test]
+    fn a_compound_command_is_planned_by_its_insurable_segment() {
+        // The first segment insures nothing, which must not make the whole
+        // command read as uninsurable.
+        let planned = plan(r#"echo hi && psql -d shop -c "TRUNCATE users""#)
+            .expect("the insurable segment must be found");
+        assert!(planned.contains("pg_dump"), "{planned}");
+    }
+
+    #[test]
+    fn take_insures_the_first_insurable_segment_of_a_compound() {
+        let tmp = TempTree::new("bk-compound");
+        let state = tmp.dir("state");
+        let doomed = tmp.file("doomed.txt", "precious");
+
+        let record = take(&state, &format!("echo hi && rm -rf {}", doomed.display()))
+            .expect("taking a backup must not fail")
+            .expect("the delete segment is insurable");
+
+        assert_eq!(record.kind, "files");
+        assert!(
+            state.join("backups").join("manifest.jsonl").is_file(),
+            "an insured operation leaves a record behind"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // git-ref insurance, against a real repository. `git_out` reads whatever
+    // repo the PROCESS is in, so these move into one.
+    // -----------------------------------------------------------------------
+
+    fn git_run(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "user.email=tests@termaxa.invalid",
+                "-c",
+                "user.name=termaxa tests",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git must be available: this is git insurance");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A working copy on `branch`, with an `origin` that already has it.
+    fn repo_with_remote(env: &TestEnv, branch: &str) -> PathBuf {
+        let root = env.root().to_path_buf();
+        let remote = root.join("remote.git");
+        git_run(
+            &root,
+            &["init", "--bare", "-q", remote.to_str().expect("utf-8 path")],
+        );
+
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).expect("work dir must be creatable");
+        git_run(&work, &["init", "-q"]);
+        git_run(
+            &work,
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+        );
+        git_run(
+            &work,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("utf-8 path"),
+            ],
+        );
+        std::fs::write(work.join("seed.txt"), "seed\n").expect("file must be writable");
+        git_run(&work, &["add", "-A"]);
+        git_run(&work, &["commit", "-q", "-m", "seed"]);
+        git_run(&work, &["push", "-q", "-u", "origin", branch]);
+        work
+    }
+
+    #[test]
+    fn the_branch_defaults_to_the_one_the_repository_is_on() {
+        let mut env = TestEnv::new("bk-branch");
+        let work = repo_with_remote(&env, "release/7");
+        env.chdir(&work);
+
+        assert_eq!(current_branch(), Some("release/7".to_string()));
+        // A force push that names no branch insures the branch you are on,
+        // not a guessed `main`.
+        assert_eq!(
+            git_force_push_target(&tokens_of("git push --force")),
+            Some(("origin".to_string(), "release/7".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_forced_push_is_insured_by_pinning_the_remote_ref() {
+        let mut env = TestEnv::new("bk-gitref");
+        let work = repo_with_remote(&env, "main");
+        env.chdir(&work);
+
+        let record = backup_git_ref(
+            "b-1",
+            "2026-01-01T00:00:00Z",
+            "git push --force origin main",
+            "origin",
+            "main",
+        )
+        .expect("the remote ref must be pinnable");
+
+        assert_eq!(record.kind, "git-ref");
+        // The snapshot has to be a real ref, or the record promises a restore
+        // that cannot happen.
+        let pinned = record.data["branch"]
+            .as_str()
+            .expect("the record names its branch");
+        assert_eq!(pinned, "termaxa/backup/b-1");
+        assert_eq!(
+            git_run(&work, &["rev-parse", pinned]),
+            git_run(&work, &["rev-parse", "origin/main"]),
+            "the backup branch must point at what the remote had"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The postgres paths, driven by stub binaries. Neither pg_dump nor psql is
+    // a reasonable test dependency, and what matters here is what the gate
+    // does with their EXIT STATUS — which a script can produce exactly.
+    // -----------------------------------------------------------------------
+
+    /// Put `name` on PATH as a script exiting with `code`, for the life of the
+    /// returned guard. PATH is process-global, so every caller holds `TestEnv`.
+    #[cfg(unix)]
+    fn stub_on_path(env: &TestEnv, name: &str, code: i32) -> PathGuard {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bin_dir = env.root().join("stub-bin");
+        std::fs::create_dir_all(&bin_dir).expect("stub dir must be creatable");
+        let path = bin_dir.join(name);
+        // Write the -f target if asked for one, so a "successful" dump leaves
+        // the file its record will name.
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-f\" ]; then : > \"$2\"; fi\n  \
+             shift\ndone\necho 'stub' >&2\n"
+                .to_string()
+                + &format!("exit {code}\n"),
+        )
+        .expect("stub must be writable");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("stub must be executable");
+
+        let previous = std::env::var_os("PATH");
+        let combined = match &previous {
+            Some(p) => format!("{}:{}", bin_dir.display(), p.to_string_lossy()),
+            None => bin_dir.display().to_string(),
+        };
+        std::env::set_var("PATH", combined);
+        PathGuard { previous }
+    }
+
+    /// Restores PATH on drop, so a failing assertion cannot leave a stub
+    /// binary in front of the real one for the rest of the process.
+    #[cfg(unix)]
+    struct PathGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dump_that_failed_is_not_recorded_as_insurance() {
+        // The one lie insurance must never tell. `hook` ignores an Err from
+        // `take` and proceeds, so the error is what keeps a phantom record
+        // out of the manifest.
+        let env = TestEnv::new("bk-pg-fail");
+        let _guard = stub_on_path(&env, "pg_dump", 1);
+        let state = env.root().join("state");
+
+        let err = take(&state, r#"psql -d shop -c "TRUNCATE users""#)
+            .expect_err("a dump that did not run is not a backup");
+        assert!(err.to_string().contains("pg_dump failed"), "{err}");
+        assert!(
+            !state.join("backups").join("manifest.jsonl").exists(),
+            "nothing may be recorded for a dump that failed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_successful_dump_is_recorded_with_the_file_it_wrote() {
+        let env = TestEnv::new("bk-pg-ok");
+        let _guard = stub_on_path(&env, "pg_dump", 0);
+        let state = env.root().join("state");
+
+        let record = take(&state, r#"psql -d shop -c "TRUNCATE users""#)
+            .expect("the dump must succeed")
+            .expect("a truncate is insurable");
+
+        assert_eq!(record.kind, "pg-dump");
+        let file = record.data["file"]
+            .as_str()
+            .expect("the record names a file");
+        assert!(
+            Path::new(file).is_file(),
+            "the record must name a dump that exists: {file}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_that_failed_is_reported_rather_than_claimed() {
+        let env = TestEnv::new("bk-restore-fail");
+        let state = env.root().join("state");
+        {
+            // Take a real record first, with a dump that works.
+            let _guard = stub_on_path(&env, "pg_dump", 0);
+            take(&state, r#"psql -d shop -c "TRUNCATE users""#)
+                .expect("the dump must succeed")
+                .expect("a truncate is insurable");
+        }
+
+        // Then fail the restore: reporting success here would leave someone
+        // believing their data came back.
+        let _guard = stub_on_path(&env, "psql", 1);
+        let id = list(&state).expect("the manifest must read")[0].id.clone();
+        let err = restore(&state, &id).expect_err("a failed restore is not a restore");
+        assert!(err.to_string().contains("psql restore failed"), "{err}");
+    }
+
+    #[test]
+    fn a_restore_push_that_failed_is_reported_rather_than_claimed() {
+        // Restoring a git ref means force-pushing the pinned sha back. If
+        // that push does not land, the remote still holds the overwritten
+        // history — saying "restored" would send someone away believing the
+        // opposite of what happened.
+        let mut env = TestEnv::new("bk-restore-push");
+        let work = repo_with_remote(&env, "main");
+        env.chdir(&work);
+        let state = env.root().join("state");
+
+        let record = backup_git_ref(
+            "b-1",
+            "2026-01-01T00:00:00Z",
+            "git push --force origin main",
+            "origin",
+            "main",
+        )
+        .expect("the remote ref must be pinnable");
+        append_manifest(&state, &record).expect("the record must be writable");
+
+        // Take the remote away, so the restore push cannot succeed.
+        std::fs::remove_dir_all(env.root().join("remote.git")).expect("remote must be removable");
+
+        let err = restore(&state, "b-1").expect_err("a push that failed is not a restore");
+        assert!(err.to_string().contains("restore push failed"), "{err}");
+    }
+
+    #[test]
+    fn a_branch_that_cannot_be_created_is_reported_not_recorded() {
+        // Recording a snapshot that was never taken tells the user they are
+        // insured when they are not — the one lie insurance must not tell.
+        let mut env = TestEnv::new("bk-gitref-fail");
+        let work = repo_with_remote(&env, "main");
+        env.chdir(&work);
+        git_run(&work, &["branch", "termaxa/backup/b-collide", "HEAD"]);
+
+        let err = backup_git_ref(
+            "b-collide",
+            "2026-01-01T00:00:00Z",
+            "git push --force origin main",
+            "origin",
+            "main",
+        )
+        .expect_err("a branch that cannot be created is not a backup");
+        assert!(err.to_string().contains("git branch failed"), "{err}");
+    }
 }
