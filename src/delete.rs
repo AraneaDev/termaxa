@@ -970,6 +970,33 @@ mod tests {
     }
 
     #[test]
+    fn a_delete_too_large_to_copy_says_that_rather_than_naming_insurance() {
+        // "Not recoverable" is ambiguous on its own: it could mean no backup
+        // engine covers the command, or that the target is simply too big to
+        // copy. Two different facts get two different sentences, and reaching
+        // this one needs a scan that actually caps.
+        let tmp = TempTree::new("del-too-large");
+        let dir = tmp.dir("huge");
+        for i in 0..(MAX_FILES + 100) {
+            std::fs::write(dir.join(format!("f{i}")), "").expect("file must be writable");
+        }
+
+        let lines = preview_lines(&format!("rm -rf {}", dir.display()), None);
+        assert!(
+            has_line(&lines, "too large to copy"),
+            "an insurable command over budget must say which fact applies: {lines:?}"
+        );
+        assert!(
+            !has_line(&lines, "insurance   :"),
+            "it cannot both promise insurance and say it is out of reach: {lines:?}"
+        );
+        assert!(
+            has_line(&lines, "+ files (stopped counting)"),
+            "the count says it stopped: {lines:?}"
+        );
+    }
+
+    #[test]
     fn a_cmd_switch_is_matched_by_shape_not_by_its_leading_slash() {
         for switch in ["/s", "/q", "/f", "/a:h", "/a:"] {
             assert!(is_cmd_switch(switch), "{switch} is a cmd switch");

@@ -11,14 +11,14 @@
 //! one that does not, or the test asserts the developer's laptop rather than
 //! the code.
 //!
-//! NOT asserted here: that a correctly wired hook reports as Live. The probe
-//! sends `rm -rf /` and waits PROBE_TIMEOUT (2s) for an answer, and answering
-//! that command means walking the filesystem to the delete preview's budget:
-//! measured at 5.8-7.1s on the machine this was written on, against 0.00s for
-//! the same probe with a target that does not exist. So the probe times out
-//! and a live hook is reported as `NOT firing — commands are ungated`.
-//! Asserting the observed behaviour here would pin that in place, so these
-//! tests assert agent DETECTION, which is decided before the probe runs.
+//! Liveness IS asserted here, and for a while it could not be. The probe
+//! sends `rm -rf /` and waits PROBE_TIMEOUT (2s), and answering that command
+//! means walking the filesystem to the delete preview's budget. That budget
+//! was consulted only between directories, so one wide directory on a slow
+//! mount ran to completion regardless: 5.8-7.1s measured here, the probe
+//! timing out, and a correctly gated setup reported as `NOT firing`. With the
+//! budget bound inside the directory as well, the same probe answers in
+//! roughly 300ms and these tests can say what they mean.
 
 #![cfg(unix)]
 
@@ -169,6 +169,54 @@ fn an_initialised_project_without_an_agent_has_nothing_to_fix() {
     assert!(
         out.stdout.contains("no agent harness detected"),
         "no agent directory and no agent binary means no harness: {:?}",
+        out.stdout
+    );
+}
+
+#[test]
+fn a_wired_hook_reports_as_live_and_leaves_nothing_to_fix() {
+    let tmp = scratch("live");
+    let bin = controlled_path(&tmp);
+    let proj = project(&tmp, DENIES);
+    wire_claude(&proj);
+    Command::new(env!("CARGO_BIN_EXE_termaxa"))
+        .arg("init")
+        .current_dir(&proj)
+        .env("TERMAXA_HOME", tmp.join("home"))
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("the binary must be runnable");
+
+    let out = doctor(&tmp.join("home"), &proj, &bin);
+    assert!(
+        out.stdout.contains("hook configured and live"),
+        "the registered command answered when doctor invoked it: {:?}",
+        out.stdout
+    );
+    // The policy denies `rm -rf /`, so the permissiveness note stays quiet.
+    assert!(!out.stdout.contains("does not deny"), "{:?}", out.stdout);
+    assert_eq!(out.code, 0, "nothing to fix: {:?}", out.stdout);
+}
+
+#[test]
+fn a_live_hook_over_a_policy_that_denies_nothing_is_flagged() {
+    // Live means "answered when doctor invoked it", which is not the same as
+    // "will stop anything". A green tick over a policy that denies nothing is
+    // worth one more line.
+    let tmp = scratch("permissive");
+    let bin = controlled_path(&tmp);
+    let proj = project(&tmp, "version: 1\ndefault: allow\nrules: []\n");
+    wire_claude(&proj);
+
+    let out = doctor(&tmp.join("home"), &proj, &bin);
+    assert!(
+        out.stdout.contains("hook configured and live"),
+        "{:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("does not deny `rm -rf /`"),
+        "a gate that stops nothing has to say so next to its tick: {:?}",
         out.stdout
     );
 }
