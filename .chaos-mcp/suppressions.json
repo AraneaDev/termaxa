@@ -87,6 +87,22 @@
         "reason": "equivalent: they differ only at exactly one --stat line, which cannot reach here — git() returns None for empty output, so the block runs only with per-file lines plus the totals line, i.e. two or more",
         "fingerprint": "a840fd70ac75"
       }
+    ],
+    "src/policy.rs": [
+      {
+        "line": 312,
+        "mutator": "replace + with * in wildcard_match",
+        "addedAt": 1786720071482,
+        "reason": "equivalent: after the mutated backtrack (pi = star) the next iteration re-enters the star branch and sets star = pi, mark = ti, pi = star + 1 — exactly the state the real branch produces, so the two reconverge before anything is observable. Checked exhaustively over 30,276 pattern/text pairs from {a, b, *} (patterns and texts up to length 6): no input distinguishes them",
+        "fingerprint": "2590c17b32bd"
+      },
+      {
+        "line": 214,
+        "mutator": "replace < with <= in Policy::evaluate",
+        "addedAt": 1786720710037,
+        "reason": "equivalent: idx < bi and idx <= bi differ only at idx == bi, and that means the same index into self.rules — so both arms of the if produce the identical (index, rule) pair and `best` is unchanged either way",
+        "fingerprint": "26f79d8eac41"
+      }
     ]
   }
 }
