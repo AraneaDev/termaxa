@@ -614,8 +614,16 @@ mod terraform_stub_tests {
     fn stub(dir: &Path, name: &str, plan: &str, code: i32) -> PathBuf {
         std::fs::create_dir_all(dir).expect("stub dir must be creatable");
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\ncat <<'PLAN'\n{plan}\nPLAN\nexit {code}\n"))
-            .expect("stub must be writable");
+        // printf rather than a heredoc through `cat`: `cat` is an external
+        // command, so the stub would depend on PATH resolving it, and PATH is
+        // exactly what the neighbouring test in this module rewrites while
+        // this one may be running. printf is a builtin and needs nothing
+        // found on disk.
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '%s\\n' \"{plan}\"\nexit {code}\n"),
+        )
+        .expect("stub must be writable");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("stub must be executable");
         path
