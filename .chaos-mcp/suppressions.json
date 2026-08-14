@@ -9,6 +9,15 @@
         "reason": "fire-and-forget notifier: the wrapper only guards and delegates, and the doctrine is that it must never affect enforcement",
         "fingerprint": "fb29c8070b2b"
       }
+    ],
+    "src/audit.rs": [
+      {
+        "line": 83,
+        "mutator": "replace > with >= in AuditLog::read_last",
+        "addedAt": 1786698460251,
+        "reason": "equivalent: the only input that separates > from >= is len == n, and there the guarded body drains 0..0, which is a no-op either way",
+        "fingerprint": "bbeea8530188"
+      }
     ]
   }
 }

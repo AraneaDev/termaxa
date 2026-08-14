@@ -97,3 +97,137 @@ pub fn now() -> (u128, String) {
         chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::testutil::TempTree;
+
+    fn entry(command: &str) -> AuditEntry {
+        let (ts_ms, ts) = now();
+        AuditEntry {
+            ts_ms,
+            ts,
+            source: "test".into(),
+            command: command.into(),
+            decision: "allow".into(),
+            matched_rule: None,
+            reason: "because".into(),
+            signals: Vec::new(),
+            escalated: false,
+            session: None,
+            backup: None,
+            preview: None,
+            intent: None,
+            approved: None,
+            exit_code: None,
+            cwd: "/work".into(),
+        }
+    }
+
+    fn log_in(tmp: &TempTree) -> AuditLog {
+        AuditLog::new(&tmp.dir("state")).expect("the log directory must be creatable")
+    }
+
+    #[test]
+    fn new_puts_the_log_under_the_state_dir_and_creates_it() {
+        let tmp = TempTree::new("audit-new");
+        let state = tmp.dir("state");
+        let log = AuditLog::new(&state).expect("the log directory must be creatable");
+
+        assert_eq!(log.path, state.join("logs").join("audit.jsonl"));
+        assert!(
+            state.join("logs").is_dir(),
+            "the directory is created up front so appends never fail on a missing parent"
+        );
+    }
+
+    #[test]
+    fn read_last_on_a_log_that_was_never_written_is_empty() {
+        let tmp = TempTree::new("audit-missing");
+        let log = log_in(&tmp);
+
+        let entries = log
+            .read_last(10)
+            .expect("no log yet is a fresh project, not a failure");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn read_last_returns_exactly_the_tail_in_order() {
+        let tmp = TempTree::new("audit-tail");
+        let log = log_in(&tmp);
+        for command in ["one", "two", "three", "four", "five"] {
+            log.append(&entry(command)).expect("append must succeed");
+        }
+
+        let tail = log.read_last(2).expect("read must succeed");
+        let commands: Vec<&str> = tail.iter().map(|e| e.command.as_str()).collect();
+        // Exactly two, oldest first: reports read the tail as a timeline.
+        assert_eq!(commands, ["four", "five"]);
+    }
+
+    #[test]
+    fn read_last_asking_for_more_than_exists_returns_everything() {
+        let tmp = TempTree::new("audit-short");
+        let log = log_in(&tmp);
+        for command in ["one", "two", "three"] {
+            log.append(&entry(command)).expect("append must succeed");
+        }
+
+        // The boundary: asking for exactly the number held, and for more.
+        let all = log.read_last(3).expect("read must succeed");
+        assert_eq!(
+            all.iter().map(|e| e.command.as_str()).collect::<Vec<_>>(),
+            ["one", "two", "three"]
+        );
+        let more = log.read_last(99).expect("read must succeed");
+        assert_eq!(more.len(), 3, "asking for more cannot invent entries");
+    }
+
+    #[test]
+    fn read_last_skips_a_line_it_cannot_parse() {
+        let tmp = TempTree::new("audit-corrupt");
+        let log = log_in(&tmp);
+        log.append(&entry("first")).expect("append must succeed");
+        // A truncated write (a killed process mid-append) must not make the
+        // whole history unreadable.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log.path)
+            .expect("log must be open-able");
+        writeln!(f, "{{\"ts_ms\": 1, oh no").expect("write must succeed");
+        drop(f);
+        log.append(&entry("second")).expect("append must succeed");
+
+        let entries = log.read_last(10).expect("read must succeed");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.command.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    #[test]
+    fn now_reports_the_same_instant_in_both_forms() {
+        let (ms, ts) = now();
+
+        // A stubbed clock (0, or 1) would sit in 1970.
+        assert!(
+            ms > 1_735_689_600_000,
+            "epoch milliseconds should be recent, got {}",
+            ms
+        );
+        let parsed = chrono::DateTime::parse_from_rfc3339(&ts)
+            .unwrap_or_else(|e| panic!("`{}` must be RFC3339 UTC: {}", ts, e));
+        let skew = (ms as i64 - parsed.timestamp_millis()).abs();
+        assert!(
+            skew < 2_000,
+            "the two halves must describe one instant, {} ms apart",
+            skew
+        );
+    }
+}
