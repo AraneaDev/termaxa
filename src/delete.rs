@@ -831,4 +831,230 @@ mod tests {
         assert_eq!(fmt_num(1000), "1,000");
         assert_eq!(fmt_num(0), "0");
     }
+
+    // -----------------------------------------------------------------------
+    // What the preview says, and what it declines to say. Every line here is
+    // read by a human deciding whether to approve a deletion.
+    // -----------------------------------------------------------------------
+
+    use crate::testutil::TestEnv;
+
+    fn preview_lines(command: &str, root: Option<&Path>) -> Vec<String> {
+        preview_for(command, root)
+            .map(|p| p.lines)
+            .unwrap_or_default()
+    }
+
+    fn has_line(lines: &[String], needle: &str) -> bool {
+        lines.iter().any(|l| l.contains(needle))
+    }
+
+    #[test]
+    fn the_as_written_line_appears_only_when_resolution_changed_something() {
+        let tmp = TempTree::new("del-written");
+        let dir = tmp.dir("target");
+
+        // An absolute path resolves to itself, and echoing it back twice is
+        // noise that trains people to skip the block.
+        let lines = preview_lines(&format!("rm -rf {}", dir.display()), None);
+        assert!(!has_line(&lines, "as written"), "{lines:?}");
+
+        // `./x` beside its absolute form is the same path to a reader.
+        let lines = preview_lines("rm -rf ./some-relative-target", None);
+        assert!(!has_line(&lines, "as written"), "{lines:?}");
+
+        // A `~` expansion genuinely changes what is about to be deleted.
+        let lines = preview_lines("rm -rf ~/some-home-target", None);
+        assert!(
+            has_line(&lines, "as written"),
+            "an expansion the reader would miss has to be shown: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_target_outside_the_project_root_is_called_out() {
+        let tmp = TempTree::new("del-outside");
+        let root = tmp.dir("project");
+        let inside = tmp.dir("project/build");
+        let outside = tmp.dir("elsewhere");
+
+        let lines = preview_lines(&format!("rm -rf {}", outside.display()), Some(&root));
+        assert!(has_line(&lines, "OUTSIDE the project root"), "{lines:?}");
+
+        let lines = preview_lines(&format!("rm -rf {}", inside.display()), Some(&root));
+        assert!(
+            !has_line(&lines, "OUTSIDE the project root"),
+            "a warning that fires on ordinary work is one nobody reads: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_target_that_does_not_exist_says_so_instead_of_counting() {
+        let tmp = TempTree::new("del-absent");
+        let missing = tmp.absent("not-here");
+        let present = tmp.dir("here");
+
+        let lines = preview_lines(&format!("rm -rf {}", missing.display()), None);
+        assert!(has_line(&lines, "does not exist"), "{lines:?}");
+        // Nothing is counted, because there is nothing there to count. (The
+        // absence is reported on the same `contains` line, so the assertion
+        // is on the count itself.)
+        assert!(!has_line(&lines, "files across"), "{lines:?}");
+
+        let lines = preview_lines(&format!("rm -rf {}", present.display()), None);
+        assert!(!has_line(&lines, "does not exist"), "{lines:?}");
+        assert!(has_line(&lines, "files across"), "{lines:?}");
+    }
+
+    #[test]
+    fn an_insurable_delete_within_budget_reports_its_insurance() {
+        let tmp = TempTree::new("del-insurance");
+        let dir = tmp.dir("small");
+        std::fs::write(dir.join("a.txt"), "a").expect("file must be writable");
+
+        let lines = preview_lines(&format!("rm -rf {}", dir.display()), None);
+        assert!(
+            has_line(&lines, "insurance   :"),
+            "a small delete is recoverable and should say so: {lines:?}"
+        );
+        assert!(
+            !has_line(&lines, "too large to copy"),
+            "nothing here is too large: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_cmd_switch_is_matched_by_shape_not_by_its_leading_slash() {
+        for switch in ["/s", "/q", "/f", "/a:h", "/a:"] {
+            assert!(is_cmd_switch(switch), "{switch} is a cmd switch");
+        }
+        // Four characters and a leading slash, but a path: `del /s /q /tmp`
+        // must keep its target.
+        for path in ["/tmp", "/usr", "/c/Users", "/a:hidden", "notaswitch"] {
+            assert!(!is_cmd_switch(path), "{path} is a path");
+        }
+    }
+
+    #[test]
+    fn a_drive_letter_is_split_only_when_it_really_is_one() {
+        assert_eq!(split_drive("c/Users/x"), Some(("c", "Users/x")));
+        assert_eq!(split_drive("c"), Some(("c", "")));
+        // `/usr/local/lib` must not resolve to `C:/usr/local/lib`.
+        assert_eq!(split_drive("usr/local/lib"), None);
+        assert_eq!(split_drive("1/x"), None);
+    }
+
+    #[test]
+    fn a_tilde_is_expanded_to_the_home_it_names() {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .expect("a home directory must be set");
+        let home = PathBuf::from(home);
+
+        assert_eq!(resolve_path("~"), home);
+        assert_eq!(resolve_path("~/projects"), home.join("projects"));
+        // A path that merely starts with the character is not an expansion.
+        assert_ne!(resolve_path("~notauser"), home.join("notauser"));
+    }
+
+    /// Sets HOME/USERPROFILE for the life of the guard. Process-global, so
+    /// every caller holds `TestEnv`'s lock.
+    struct HomeGuard {
+        home: Option<std::ffi::OsString>,
+        profile: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(home: Option<&Path>) -> Self {
+            let guard = HomeGuard {
+                home: std::env::var_os("HOME"),
+                profile: std::env::var_os("USERPROFILE"),
+            };
+            std::env::remove_var("USERPROFILE");
+            match home {
+                Some(p) => std::env::set_var("HOME", p),
+                None => std::env::remove_var("HOME"),
+            }
+            guard
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.home.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.profile.take() {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_home_and_its_siblings_are_recognised_as_profiles() {
+        let env = TestEnv::new("del-profile");
+        let users = env.root().join("home");
+        let alice = users.join("alice");
+        std::fs::create_dir_all(&alice).expect("home must be creatable");
+        let _guard = HomeGuard::set(Some(&alice));
+
+        assert!(is_user_profile(&alice), "the home itself");
+        assert!(
+            is_user_profile(&users.join("bob")),
+            "a sibling profile: an agent on a mistyped path lands here"
+        );
+        assert!(
+            !is_user_profile(&alice.join("projects")),
+            "something inside a profile is not the profile"
+        );
+        assert!(
+            !is_user_profile(&env.root().join("etc")),
+            "a different parent is a different thing"
+        );
+        // Same depth as the home, different parent. Depth alone must not
+        // make something a profile, or every third-level directory on the
+        // machine becomes one.
+        let same_depth_elsewhere = env.root().join("srv").join("bob");
+        assert!(!is_user_profile(&same_depth_elsewhere), "{}", same_depth_elsewhere.display());
+    }
+
+    #[test]
+    fn the_profile_shapes_are_recognised_even_with_no_home_set() {
+        let _env = TestEnv::new("del-profile-fallback");
+        let _guard = HomeGuard::set(None);
+
+        assert!(is_user_profile(Path::new("/home/alice")));
+        assert!(is_user_profile(Path::new("/Users/alice")));
+        assert!(is_user_profile(Path::new("C:\\Users\\alice")));
+        assert!(!is_user_profile(Path::new("/home/alice/projects")));
+        assert!(!is_user_profile(Path::new("/etc")));
+    }
+
+    #[test]
+    fn sensitive_children_are_named_whatever_their_casing() {
+        let tmp = TempTree::new("del-sensitive");
+        let dir = tmp.dir("home");
+        std::fs::create_dir_all(dir.join(".SSH")).expect("dir must be creatable");
+        std::fs::write(dir.join(".env"), "SECRET=1").expect("file must be writable");
+        std::fs::write(dir.join("notes.txt"), "hello").expect("file must be writable");
+
+        let found = sensitive_children(&dir);
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&".SSH"),
+            "an upper-case spelling holds the same keys: {names:?}"
+        );
+        assert!(names.contains(&".env"), "{names:?}");
+        assert_eq!(
+            found.len(),
+            2,
+            "two different sensitive entries are two findings: {names:?}"
+        );
+        assert!(
+            !names.contains(&"notes.txt"),
+            "ordinary files are not findings: {names:?}"
+        );
+    }
 }
