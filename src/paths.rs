@@ -287,7 +287,7 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    use crate::testutil::TestEnv;
+    use crate::testutil::{TempTree, TestEnv};
 
     #[test]
     fn hash_key_stable_across_path_representations() {
@@ -324,6 +324,138 @@ mod tests {
             paths.state_dir.starts_with(env.home()),
             "state must resolve under this test's own TERMAXA_HOME, got {}",
             paths.state_dir.display()
+        );
+    }
+
+    #[test]
+    fn only_a_drive_letter_is_case_folded() {
+        // The lowercasing exists for `C:` vs `c:`. A directory name that
+        // merely starts with a letter must keep its case, or two different
+        // projects can share a state directory.
+        assert_eq!(hash_key("Users/x/proj"), "Users/x/proj");
+        assert_ne!(hash_key("Users/x/proj"), hash_key("users/x/proj"));
+    }
+
+    #[test]
+    fn the_root_path_survives_both_guards() {
+        // One character: the trailing-slash strip must not eat the only
+        // thing there is, and the drive-letter check must not read a second
+        // byte that does not exist.
+        assert_eq!(hash_key("/"), "/");
+        assert_eq!(hash_key("/a/"), "/a");
+        assert_eq!(hash_key("/a///"), "/a");
+    }
+
+    #[test]
+    fn the_hash_is_the_published_algorithm_not_merely_a_stable_one() {
+        // Golden values. Any other mixing step still produces hashes that are
+        // stable and distinct, so only a known answer pins FNV-1a itself —
+        // and the state directory a project resolves to depends on it.
+        assert_eq!(fnv1a_hex8("abc"), "e25ef552");
+        assert_eq!(fnv1a_hex8("/home/u/proj"), "430add1b");
+    }
+
+    #[test]
+    fn demo_state_dir_sits_under_the_home_and_is_ready_to_write() {
+        let env = TestEnv::new("demo-state");
+        let dir = demo_state_dir().expect("demo state must resolve");
+
+        assert!(
+            dir.starts_with(env.home()),
+            "demo state belongs under TERMAXA_HOME, got {}",
+            dir.display()
+        );
+        assert!(dir.ends_with("demo"));
+        // A zero-setup check writes immediately; the directories have to be
+        // there before it does.
+        assert!(dir.join("logs").is_dir());
+        assert!(dir.join("backups").is_dir());
+    }
+
+    #[test]
+    fn legacy_in_repo_state_is_moved_and_its_recorded_paths_rewritten() {
+        let env = TestEnv::new("migrate");
+        let proj = env.project("legacy");
+        let in_repo = proj.join(".termaxa");
+
+        // The pre-v0.8 layout: logs and backups inside the repository.
+        std::fs::create_dir_all(in_repo.join("logs")).expect("legacy logs must be creatable");
+        std::fs::write(
+            in_repo.join("logs").join("audit.jsonl"),
+            "{\"command\":\"legacy entry\"}\n",
+        )
+        .expect("legacy log must be writable");
+
+        let old_backups = in_repo.join("backups");
+        std::fs::create_dir_all(&old_backups).expect("legacy backups must be creatable");
+        let payload = old_backups.join("payload.sql");
+        std::fs::write(&payload, "-- dump\n").expect("payload must be writable");
+        let record = serde_json::json!({
+            "id": "b1",
+            "data": { "file": payload.display().to_string() },
+        });
+        std::fs::write(
+            old_backups.join("manifest.jsonl"),
+            format!("{}\n", record),
+        )
+        .expect("legacy manifest must be writable");
+
+        let paths = resolve_from(&proj).expect("resolve must migrate on the way past");
+
+        // Nothing is left behind in the repository.
+        assert!(!in_repo.join("logs").join("audit.jsonl").exists());
+        assert!(!payload.exists());
+
+        // The payload moved, or `rollback` would point at nothing.
+        let new_backups = paths.state_dir.join("backups");
+        assert!(
+            new_backups.join("payload.sql").is_file(),
+            "the payload must arrive at {}",
+            new_backups.display()
+        );
+
+        // The old log is appended to the home log rather than replacing it.
+        let log = std::fs::read_to_string(paths.log_file()).expect("the log must be readable");
+        assert!(log.contains("legacy entry"), "{log:?}");
+
+        // And every recorded path is rewritten, which is the whole reason the
+        // manifest is handled apart from the payloads it names.
+        let manifest = std::fs::read_to_string(new_backups.join("manifest.jsonl"))
+            .expect("the manifest must be readable");
+        assert!(
+            manifest.contains(&new_backups.join("payload.sql").display().to_string()),
+            "the record must name the payload's new home: {manifest:?}"
+        );
+        assert!(
+            !manifest.contains(&old_backups.display().to_string()),
+            "no record may still point into the repository: {manifest:?}"
+        );
+    }
+
+    #[test]
+    fn copy_recursive_reproduces_a_whole_tree() {
+        // `move_path` only reaches this when `rename` fails, i.e. across a
+        // filesystem — and then it is the only thing between a backup and a
+        // lost payload.
+        let tmp = TempTree::new("copy-tree");
+        let src = tmp.dir("src");
+        std::fs::create_dir_all(src.join("nested").join("deeper"))
+            .expect("tree must be creatable");
+        std::fs::write(src.join("top.txt"), "top").expect("file must be writable");
+        std::fs::write(src.join("nested").join("deeper").join("leaf.txt"), "leaf")
+            .expect("file must be writable");
+
+        let dst = tmp.absent("dst");
+        copy_recursive(&src, &dst).expect("the tree must copy");
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("top.txt")).expect("top must arrive"),
+            "top"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("nested").join("deeper").join("leaf.txt"))
+                .expect("the nested leaf must arrive"),
+            "leaf"
         );
     }
 
