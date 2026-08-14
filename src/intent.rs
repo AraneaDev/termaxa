@@ -957,4 +957,264 @@ mod tests {
         assert!(c.enabled);
         assert_eq!(c.threshold, 2);
     }
+
+    // -----------------------------------------------------------------------
+    // Spellings. Every predicate below decides whether a command presses the
+    // circuit breaker, so a flag it fails to recognise is a command that
+    // accumulates no pressure at all.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_most_severe_intent_in_a_compound_is_the_one_reported() {
+        // Ordered worst-first on purpose: a ranking that returned a constant
+        // would still pick the last one and look correct.
+        assert_eq!(
+            classify_command(r#"psql -c "DROP TABLE users" && rm -rf ./build"#),
+            Some(Intent::DbDestroy)
+        );
+    }
+
+    #[test]
+    fn a_delete_counts_when_it_is_recursive_or_forced_in_any_dialect() {
+        for command in [
+            "rm -r ./dir",
+            "rm -f notes.txt",
+            "rm -rf ./dir",
+            "rm --force notes.txt",
+            "del /s C:\\tmp",
+            "del /q C:\\tmp",
+            "Remove-Item -Recurse ./dir",
+            "Remove-Item -Force notes.txt",
+        ] {
+            assert_eq!(
+                classify_command(command),
+                Some(Intent::FileDelete),
+                "{command}"
+            );
+        }
+        // A single-file delete with no force and no recursion is ordinary work.
+        assert_eq!(classify_command("rm notes.txt"), None);
+    }
+
+    #[test]
+    fn a_long_flag_that_merely_contains_the_letter_is_not_the_short_flag() {
+        // `-r` and `-f` are read out of bundled short flags, so the letter
+        // test must not reach into long options that happen to spell one.
+        // All three are real rm options: the first two carry an `r`, and
+        // `--one-file-system` carries an `f`.
+        assert_eq!(classify_command("rm --verbose notes.txt"), None);
+        assert_eq!(classify_command("rm --preserve-root notes.txt"), None);
+        assert_eq!(classify_command("rm --one-file-system ./dir"), None);
+    }
+
+    #[test]
+    fn find_and_xargs_count_only_when_they_invoke_a_delete() {
+        for command in [
+            "find . -delete",
+            "find . -mindepth 1 -exec rm -rf {} +",
+            "find . -execdir unlink {} ;",
+            "xargs rm -rf",
+        ] {
+            assert_eq!(
+                classify_command(command),
+                Some(Intent::FileDelete),
+                "{command}"
+            );
+        }
+        // An -exec that runs something harmless is not a delete.
+        assert_eq!(classify_command("find . -exec ls {} +"), None);
+        assert_eq!(classify_command("xargs ls -la"), None);
+    }
+
+    #[test]
+    fn shred_counts_only_when_it_also_removes() {
+        assert_eq!(
+            classify_command("shred -u secrets.txt"),
+            Some(Intent::FileDelete)
+        );
+        assert_eq!(
+            classify_command("shred --remove secrets.txt"),
+            Some(Intent::FileDelete)
+        );
+        // Overwriting in place leaves the file there.
+        assert_eq!(classify_command("shred secrets.txt"), None);
+        // And the flag belongs to shred, not to whatever else spells it.
+        assert_eq!(classify_command("ls -u"), None);
+    }
+
+    #[test]
+    fn every_git_spelling_that_destroys_history_is_recognised() {
+        for command in [
+            "git push --force origin main",
+            "git push -f origin main",
+            "git push --force-with-lease origin main",
+            "git push origin +main",
+            "git reset --hard HEAD~3",
+            "git branch -D feature",
+        ] {
+            assert_eq!(
+                classify_command(command),
+                Some(Intent::GitDestructive),
+                "{command}"
+            );
+        }
+        for benign in [
+            "git push origin main",
+            "git reset --soft HEAD~1",
+            "git branch -d merged-feature",
+        ] {
+            assert_eq!(classify_command(benign), None, "{benign}");
+        }
+    }
+
+    /// KNOWN GAP, pinned so a fix flips it deliberately rather than by
+    /// accident: `git clean -f` is classified and `git clean --force` is not.
+    /// The two spellings delete the same untracked files. The rm predicate a
+    /// few lines above handles its own long form by listing `--force`
+    /// explicitly; this one only reads bundled short flags, so the long
+    /// spelling presses nothing toward the breaker and shows no intent in the
+    /// report.
+    #[test]
+    fn git_clean_recognises_only_the_short_force_flag() {
+        assert_eq!(
+            classify_command("git clean -f"),
+            Some(Intent::GitDestructive)
+        );
+        assert_eq!(
+            classify_command("git clean -fd"),
+            Some(Intent::GitDestructive)
+        );
+        assert_eq!(
+            classify_command("git clean --force"),
+            None,
+            "if this ever starts classifying, the gap was fixed and this test \
+             should be inverted rather than deleted"
+        );
+        // A dry run destroys nothing either way.
+        assert_eq!(classify_command("git clean -n"), None);
+    }
+
+    #[test]
+    fn destructive_sql_is_recognised_through_a_db_client() {
+        for sql in [
+            "DROP TABLE users",
+            "DROP DATABASE shop",
+            "DROP SCHEMA public CASCADE",
+            "TRUNCATE users",
+            "DELETE FROM users",
+        ] {
+            assert_eq!(
+                classify_command(&format!(r#"psql -d shop -c "{sql}""#)),
+                Some(Intent::DbDestroy),
+                "{sql}"
+            );
+        }
+        // A bounded delete is ordinary work, and a read is not destruction.
+        assert_eq!(
+            classify_command(r#"psql -d shop -c "DELETE FROM users WHERE id = 1""#),
+            None
+        );
+        assert_eq!(classify_command(r#"psql -d shop -c "SELECT 1""#), None);
+    }
+
+    #[test]
+    fn infrastructure_teardown_is_recognised_by_its_verb() {
+        for command in ["terraform destroy", "tofu destroy", "kubectl delete pod web"] {
+            assert_eq!(
+                classify_command(command),
+                Some(Intent::InfraDestroy),
+                "{command}"
+            );
+        }
+        for benign in ["terraform plan", "kubectl get pods"] {
+            assert_eq!(classify_command(benign), None, "{benign}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The tail read. The breaker only sees what this window returns, so its
+    // size and its boundary decide whether repeated attempts accumulate.
+    // -----------------------------------------------------------------------
+
+    /// A log of `n` entries, every line padded to exactly `LINE` bytes so the
+    /// read window can be aligned on a line boundary on purpose.
+    fn padded_log(dir: &std::path::Path, n: usize) -> std::path::PathBuf {
+        const LINE: usize = 1024;
+        let path = dir.join("audit.jsonl");
+        let mut out = String::new();
+        for i in 0..n {
+            let mut entry = serde_json::json!({
+                "session": "sess-1",
+                "source": "hook",
+                "command": format!("rm -rf ./dir{i}"),
+                "decision": "deny",
+                "intent": Intent::FileDelete.label(),
+                "pad": "",
+            });
+            let base = serde_json::to_string(&entry).expect("entry must serialize");
+            // -1 for the newline this line will carry.
+            let pad = LINE - 1 - base.len();
+            entry["pad"] = serde_json::Value::String("x".repeat(pad));
+            let line = serde_json::to_string(&entry).expect("entry must serialize");
+            assert_eq!(line.len(), LINE - 1, "every line must be exactly {LINE} bytes");
+            out.push_str(&line);
+            out.push('\n');
+        }
+        std::fs::write(&path, out).expect("log must be writable");
+        path
+    }
+
+    #[test]
+    fn the_window_reads_back_the_bytes_it_promises() {
+        let tmp = TempTree::new("intent-window");
+        // 128 KiB of log: twice the window, so the count is decided by the
+        // window size rather than by how much was written.
+        let log = padded_log(tmp.path(), 128);
+
+        let counted = recent_intent_count(&log, "sess-1", Intent::FileDelete, 64 * 1024);
+        assert_eq!(
+            counted, 63,
+            "64 KiB holds 64 lines, and the one the window lands on top of is \
+             dropped as possibly partial"
+        );
+
+        // A smaller window sees proportionally less, which is what makes the
+        // constant load-bearing.
+        let counted = recent_intent_count(&log, "sess-1", Intent::FileDelete, 8 * 1024);
+        assert_eq!(counted, 7);
+    }
+
+    #[test]
+    fn the_breaker_looks_back_further_than_a_line_or_two() {
+        // The window is the whole reason repeated attempts accumulate.
+        // Shrink it and a session that is plainly flailing reads as a first
+        // offence, which is the failure mode the breaker exists to prevent.
+        let tmp = TempTree::new("intent-trip-window");
+        let log = padded_log(tmp.path(), 128);
+        let policy = tmp.file(
+            "policy.yaml",
+            "version: 1\ndefault: ask\nrules: []\ncircuit_breaker:\n  enabled: true\n  threshold: 5\n",
+        );
+
+        let (intent, prior, _reason) = maybe_trip(&policy, &log, Some("sess-1"), "rm -rf ./another")
+            .expect("dozens of prior denied attempts is well past a threshold of 5");
+        assert_eq!(intent, Intent::FileDelete);
+        assert!(
+            prior >= 60,
+            "the window must reach back across the whole log, counted {prior}"
+        );
+    }
+
+    #[test]
+    fn a_log_smaller_than_the_window_is_read_whole() {
+        // start == 0, so there is no partial first line to drop, and dropping
+        // one anyway would lose a real attempt.
+        let tmp = TempTree::new("intent-whole");
+        let log = padded_log(tmp.path(), 4);
+
+        assert_eq!(
+            recent_intent_count(&log, "sess-1", Intent::FileDelete, 64 * 1024),
+            4
+        );
+    }
 }
