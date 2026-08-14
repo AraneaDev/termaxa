@@ -71,6 +71,22 @@
         "reason": "platform-gated: the #[cfg(not(any(unix, windows)))] fallback, compiled on neither of the targets this project ships — unreachable from any test here",
         "fingerprint": "fcbcf165908d"
       }
+    ],
+    "src/preview.rs": [
+      {
+        "line": 54,
+        "mutator": "replace > with >= in generate",
+        "addedAt": 1786713336077,
+        "reason": "equivalent: the two differ only at one segment, and there find_map over that single segment calls generate_one with the same text — normalize trims the whitespace, and a dropped trailing separator is an inert token to every downstream parser (pg tokenizes, git matches a prefix)",
+        "fingerprint": "b573b51bf054"
+      },
+      {
+        "line": 168,
+        "mutator": "replace > with >= in git_push_preview",
+        "addedAt": 1786713336077,
+        "reason": "equivalent: they differ only at exactly one --stat line, which cannot reach here — git() returns None for empty output, so the block runs only with per-file lines plus the totals line, i.e. two or more",
+        "fingerprint": "a840fd70ac75"
+      }
     ]
   }
 }
