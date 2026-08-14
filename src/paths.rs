@@ -417,15 +417,27 @@ mod tests {
 
         // And every recorded path is rewritten, which is the whole reason the
         // manifest is handled apart from the payloads it names.
+        //
+        // Compared as a PATH rather than as text: the manifest is JSON, so on
+        // Windows every separator in it is an escaped backslash and a raw path
+        // never appears literally. Matching the rendering rather than the
+        // value passed on both other platforms and failed only where the
+        // escaping exists.
         let manifest = std::fs::read_to_string(new_backups.join("manifest.jsonl"))
             .expect("the manifest must be readable");
-        assert!(
-            manifest.contains(&new_backups.join("payload.sql").display().to_string()),
-            "the record must name the payload's new home: {manifest:?}"
+        let record: serde_json::Value =
+            serde_json::from_str(manifest.trim()).expect("the record must still be JSON");
+        let recorded = record["data"]["file"]
+            .as_str()
+            .expect("the record names its payload");
+        assert_eq!(
+            Path::new(recorded),
+            new_backups.join("payload.sql"),
+            "the record must name the payload's new home"
         );
         assert!(
-            !manifest.contains(&old_backups.display().to_string()),
-            "no record may still point into the repository: {manifest:?}"
+            !Path::new(recorded).starts_with(&old_backups),
+            "no record may still point into the repository: {recorded}"
         );
     }
 
