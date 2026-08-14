@@ -215,6 +215,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_colour_helper_keeps_the_text_it_wraps() {
+        // The words are the product: a helper that dropped or replaced its
+        // text would still "look coloured" to a passing eye.
+        for (name, got) in [
+            ("green", green("hello")),
+            ("amber", amber("hello")),
+            ("red", red("hello")),
+            ("dim", dim("hello")),
+            ("bold", bold("hello")),
+            ("cyan", cyan("hello")),
+        ] {
+            assert!(got.contains("hello"), "{name}() dropped its text: {got:?}");
+        }
+    }
+
+    #[test]
+    fn every_colour_helper_answers_to_the_same_gate() {
+        // Either all of them wrap or none does. A mixed answer means one
+        // stopped consulting `colour_enabled` and hard-coded its own verdict.
+        for (name, got) in [
+            ("green", green("x")),
+            ("amber", amber("x")),
+            ("red", red("x")),
+            ("dim", dim("x")),
+            ("bold", bold("x")),
+            ("cyan", cyan("x")),
+        ] {
+            assert_eq!(
+                got != "x",
+                colour_enabled(),
+                "{name}() disagrees with the colour gate: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_decision_word_passes_through_unchanged() {
+        // `decision` is a presentation map, not a validator: a word it does
+        // not know must still reach the reader.
+        assert_eq!(decision("skipped"), "skipped");
+        assert!(mark("skipped", "hook").contains('•'));
+    }
+
     /// Test helper: drop ANSI escape sequences so assertions can look at the
     /// text a human would see.
     fn strip_ansi(s: &str) -> String {
