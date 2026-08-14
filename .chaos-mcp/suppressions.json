@@ -172,6 +172,22 @@
         "reason": "equivalent: i = j lands on the '&' itself, which the next iteration matches with the default arm and steps over, arriving at the same position as i = j + 1",
         "fingerprint": "507d53aa5804"
       }
+    ],
+    "src/pg.rs": [
+      {
+        "line": 472,
+        "mutator": "replace += with *= in parse_one",
+        "addedAt": 1786741147106,
+        "reason": "equivalent: i is 2 at this point (DROP TABLE consumed), and 2 += 2 and 2 *= 2 both give 4. The only value reaching this line makes the two operators identical",
+        "fingerprint": "3f4e5968e63f"
+      },
+      {
+        "line": 538,
+        "mutator": "replace += with *= in read_table_list",
+        "addedAt": 1786742128600,
+        "reason": "equivalent: i *= 1 leaves the standalone comma token to be re-read at the top of the loop, where clean_ident rejects it (trimming the commas leaves an empty string) and nothing is pushed. The loop advances past it on the next pass and converges on the same table list",
+        "fingerprint": "48eb3131a719"
+      }
     ]
   }
 }
