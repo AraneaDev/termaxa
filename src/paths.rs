@@ -394,11 +394,8 @@ mod tests {
             "id": "b1",
             "data": { "file": payload.display().to_string() },
         });
-        std::fs::write(
-            old_backups.join("manifest.jsonl"),
-            format!("{}\n", record),
-        )
-        .expect("legacy manifest must be writable");
+        std::fs::write(old_backups.join("manifest.jsonl"), format!("{}\n", record))
+            .expect("legacy manifest must be writable");
 
         let paths = resolve_from(&proj).expect("resolve must migrate on the way past");
 
@@ -439,8 +436,7 @@ mod tests {
         // lost payload.
         let tmp = TempTree::new("copy-tree");
         let src = tmp.dir("src");
-        std::fs::create_dir_all(src.join("nested").join("deeper"))
-            .expect("tree must be creatable");
+        std::fs::create_dir_all(src.join("nested").join("deeper")).expect("tree must be creatable");
         std::fs::write(src.join("top.txt"), "top").expect("file must be writable");
         std::fs::write(src.join("nested").join("deeper").join("leaf.txt"), "leaf")
             .expect("file must be writable");

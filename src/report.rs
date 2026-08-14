@@ -609,7 +609,13 @@ mod tests {
     #[test]
     fn the_risk_bands_are_pinned_at_their_boundaries() {
         // One ask is one point, so the count IS the score here.
-        for (asks, label) in [(0, "Low"), (2, "Low"), (3, "Medium"), (7, "Medium"), (8, "High")] {
+        for (asks, label) in [
+            (0, "Low"),
+            (2, "Low"),
+            (3, "Medium"),
+            (7, "Medium"),
+            (8, "High"),
+        ] {
             let mut entries = vec![entry("allow", "ls")];
             entries.extend(n_of("ask", asks));
             let (r, _tree) = compute_for(&entries);
@@ -677,12 +683,18 @@ mod tests {
         assert_eq!(r.breaker_trips, 3);
         assert_eq!(
             r.intents,
-            [("file-delete".to_string(), 3), ("db-destroy".to_string(), 1)],
+            [
+                ("file-delete".to_string(), 3),
+                ("db-destroy".to_string(), 1)
+            ],
             "intents count every classification, blocked or not"
         );
         assert_eq!(
             r.trips_by_intent,
-            [("file-delete".to_string(), 2), ("db-destroy".to_string(), 1)],
+            [
+                ("file-delete".to_string(), 2),
+                ("db-destroy".to_string(), 1)
+            ],
             "trips count only what the breaker actually stopped"
         );
     }
@@ -788,7 +800,13 @@ mod tests {
         let roll = compute_rollup(&[stale, fresh], 30);
         assert_eq!(roll.days, 30);
         assert_eq!(
-            (roll.commands, roll.sessions, roll.allow, roll.ask, roll.deny),
+            (
+                roll.commands,
+                roll.sessions,
+                roll.allow,
+                roll.ask,
+                roll.deny
+            ),
             (1, 1, 1, 0, 0),
             "the entry from 31 days ago is outside a 30-day window"
         );

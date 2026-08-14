@@ -791,7 +791,10 @@ mod tests {
         let (tables, _) = truncate_of("TRUNCATE ONLY users");
         assert_eq!(tables, ["users"]);
 
-        match parse_destructive("DELETE FROM ONLY users").into_iter().next() {
+        match parse_destructive("DELETE FROM ONLY users")
+            .into_iter()
+            .next()
+        {
             Some(Destructive::DeleteFrom { table, has_where }) => {
                 assert_eq!(table, "users");
                 assert!(!has_where);
@@ -881,7 +884,12 @@ mod tests {
         let args = connection_args(&shell_tokens(
             "psql -h db.internal -p 5433 -U app -d shop -c \"TRUNCATE users\"",
         ));
-        for pair in [["-h", "db.internal"], ["-p", "5433"], ["-U", "app"], ["-d", "shop"]] {
+        for pair in [
+            ["-h", "db.internal"],
+            ["-p", "5433"],
+            ["-U", "app"],
+            ["-d", "shop"],
+        ] {
             assert!(
                 args.windows(2).any(|w| w == pair),
                 "{pair:?} must survive: {args:?}"
@@ -1038,7 +1046,11 @@ mod tests {
             "{:?}",
             p.lines
         );
-        assert!(p.lines.iter().any(|l| l.contains("TRUNCATE users")), "{:?}", p.lines);
+        assert!(
+            p.lines.iter().any(|l| l.contains("TRUNCATE users")),
+            "{:?}",
+            p.lines
+        );
     }
 
     #[test]

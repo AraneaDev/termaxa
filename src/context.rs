@@ -97,6 +97,22 @@ pub fn apply(decision: Decision, signals: &[Signal]) -> (Decision, bool) {
     (decision, false)
 }
 
+fn current_git_branch() -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,7 +189,10 @@ mod tests {
 
         let signal = branch_signal(&gather("git push origin main"));
         assert_eq!(signal.label, "current branch: main");
-        assert!(signal.escalate, "a push to main is the case this exists for");
+        assert!(
+            signal.escalate,
+            "a push to main is the case this exists for"
+        );
     }
 
     #[test]
@@ -295,21 +314,5 @@ mod tests {
         assert_eq!(out.action, Action::Allow);
         assert!(!escalated);
         assert_eq!(out.reason, "base", "an untouched decision keeps its reason");
-    }
-}
-
-fn current_git_branch() -> Option<String> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if branch.is_empty() {
-        None
-    } else {
-        Some(branch)
     }
 }

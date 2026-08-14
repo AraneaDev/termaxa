@@ -145,7 +145,11 @@ fn a_directory_with_nothing_in_it_is_reported_as_such() {
         "with no agent directory and no agent binary, there is no harness: {:?}",
         out.stdout
     );
-    assert!(out.stdout.contains("run `termaxa init`"), "{:?}", out.stdout);
+    assert!(
+        out.stdout.contains("run `termaxa init`"),
+        "{:?}",
+        out.stdout
+    );
 }
 
 #[test]
@@ -165,7 +169,11 @@ fn an_initialised_project_without_an_agent_has_nothing_to_fix() {
 
     let out = doctor(&tmp.join("home"), &proj, &bin);
     assert_eq!(out.code, 0, "nothing left to fix: {:?}", out.stdout);
-    assert!(out.stdout.contains("Everything checks out"), "{:?}", out.stdout);
+    assert!(
+        out.stdout.contains("Everything checks out"),
+        "{:?}",
+        out.stdout
+    );
     assert!(
         out.stdout.contains("no agent harness detected"),
         "no agent directory and no agent binary means no harness: {:?}",

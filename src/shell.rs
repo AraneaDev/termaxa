@@ -535,7 +535,11 @@ mod tests {
         assert!(segs[1].starts_with("rm -rf"), "{segs:?}");
 
         let targets = redirect_targets("echo 'a\"b' > out.txt");
-        assert_eq!(targets.len(), 1, "the redirect is outside the quotes: {targets:?}");
+        assert_eq!(
+            targets.len(),
+            1,
+            "the redirect is outside the quotes: {targets:?}"
+        );
         assert_eq!(targets[0].target, "out.txt");
     }
 
@@ -546,7 +550,10 @@ mod tests {
         // and the `&&` becomes a separator.
         let segs = split_segments("echo \"a\\\"b && c\"");
         assert_eq!(segs.len(), 1, "{segs:?}");
-        assert_eq!(segs[0], "echo \"a\\\"b && c\"", "the text must survive intact");
+        assert_eq!(
+            segs[0], "echo \"a\\\"b && c\"",
+            "the text must survive intact"
+        );
     }
 
     #[test]

@@ -1090,7 +1090,11 @@ mod tests {
         // make something a profile, or every third-level directory on the
         // machine becomes one.
         let same_depth_elsewhere = env.root().join("srv").join("bob");
-        assert!(!is_user_profile(&same_depth_elsewhere), "{}", same_depth_elsewhere.display());
+        assert!(
+            !is_user_profile(&same_depth_elsewhere),
+            "{}",
+            same_depth_elsewhere.display()
+        );
     }
 
     #[test]

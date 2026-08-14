@@ -100,7 +100,10 @@ mod tests {
     /// is to be the thing receiving it.
     fn capture<F: FnOnce(String)>(status: &str, body_of: F) -> Option<String> {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a local port must be bindable");
-        let port = listener.local_addr().expect("the port must be readable").port();
+        let port = listener
+            .local_addr()
+            .expect("the port must be readable")
+            .port();
         let status = status.to_string();
 
         let handle = std::thread::spawn(move || {
@@ -224,4 +227,3 @@ mod tests {
         maybe_send(&policy, "deny", "rm -rf /", "matched", "hook");
     }
 }
-

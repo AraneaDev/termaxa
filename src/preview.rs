@@ -374,7 +374,12 @@ mod push_preview_tests {
         git_run(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
         git_run(
             &work,
-            &["remote", "add", "origin", remote.to_str().expect("utf-8 path")],
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("utf-8 path"),
+            ],
         );
         commit_one(&work, "seed.txt", "seed");
         git_run(&work, &["push", "-q", "-u", "origin", "main"]);
@@ -447,7 +452,11 @@ mod push_preview_tests {
             p.summary
         );
         let listed = p.lines.iter().filter(|l| l.contains("commit ")).count();
-        assert_eq!(listed, 5, "five commits are listed, then a tally: {:?}", p.lines);
+        assert_eq!(
+            listed, 5,
+            "five commits are listed, then a tally: {:?}",
+            p.lines
+        );
         assert!(
             p.lines.iter().any(|l| l.contains("... and 2 more")),
             "the hidden ones are counted, not dropped: {:?}",
@@ -479,11 +488,7 @@ mod push_preview_tests {
             "nothing is lost, so nothing is claimed: {}",
             p.summary
         );
-        assert!(
-            !p.lines.iter().any(|l| l.contains("LOSE")),
-            "{:?}",
-            p.lines
-        );
+        assert!(!p.lines.iter().any(|l| l.contains("LOSE")), "{:?}", p.lines);
     }
 
     #[test]
@@ -494,7 +499,7 @@ mod push_preview_tests {
         let mut env = TestEnv::new("preview-force-loss");
         let work = repo_with_remote(&mut env);
         let remote = env.root().join("remote.git");
-        advance_the_remote(&env.root().to_path_buf(), &remote);
+        advance_the_remote(env.root(), &remote);
         git_run(&work, &["fetch", "-q", "origin"]);
 
         // `-f` alone, not `--force`: both spellings must count as force.

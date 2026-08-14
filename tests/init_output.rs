@@ -41,7 +41,11 @@ fn init_in(home: &Path, dir: &Path, bin: &Path) -> String {
         .env("PATH", bin)
         .output()
         .expect("the binary must be runnable");
-    assert!(out.status.success(), "init should succeed: {:?}", out.status);
+    assert!(
+        out.status.success(),
+        "init should succeed: {:?}",
+        out.status
+    );
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -93,10 +97,7 @@ fn the_manual_snippet_is_printed_for_people_wiring_by_hand() {
     std::fs::create_dir_all(&proj).expect("dir must be creatable");
 
     let out = init_in(&tmp.join("home"), &proj, &bin);
-    assert!(
-        out.contains(".claude/settings.json snippet:"),
-        "{out:?}"
-    );
+    assert!(out.contains(".claude/settings.json snippet:"), "{out:?}");
     assert!(
         out.contains("\"command\": \"termaxa hook\""),
         "the snippet has to carry the command it is telling you to paste: {out:?}"

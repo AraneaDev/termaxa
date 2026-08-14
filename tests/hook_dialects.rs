@@ -707,7 +707,10 @@ fn a_probe_denial_notifies_nobody_while_a_real_one_does() {
     use std::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("a local port must be bindable");
-    let port = listener.local_addr().expect("the port must be readable").port();
+    let port = listener
+        .local_addr()
+        .expect("the port must be readable")
+        .port();
     listener
         .set_nonblocking(true)
         .expect("the listener must be non-blocking");
@@ -763,10 +766,5 @@ fn a_probe_denial_notifies_nobody_while_a_real_one_does() {
     let mut probe = denial.clone();
     probe["session_id"] = serde_json::Value::String("termaxa-doctor-probe".into());
     hook(&home, &proj, &probe, &[("TERMAXA_HOOK_PROBE", "1")]);
-    assert_eq!(
-        arrivals(&listener),
-        0,
-        "a diagnostic must not page anyone"
-    );
+    assert_eq!(arrivals(&listener), 0, "a diagnostic must not page anyone");
 }
-

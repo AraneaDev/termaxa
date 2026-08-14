@@ -655,7 +655,10 @@ mod tests {
 
     #[test]
     fn only_git_push_itself_is_a_forced_push() {
-        assert_eq!(git_force_push_target(&tokens_of("git commit --force")), None);
+        assert_eq!(
+            git_force_push_target(&tokens_of("git commit --force")),
+            None
+        );
         assert_eq!(
             git_force_push_target(&tokens_of("hub push --force origin main")),
             None
@@ -669,8 +672,8 @@ mod tests {
         assert_eq!(tables, ["users"]);
         assert!(data_only, "the table survives a truncate; only its rows go");
 
-        let (tables, data_only) =
-            pg_backup_targets(r#"psql -d shop -c "DROP TABLE users""#).expect("a drop is insurable");
+        let (tables, data_only) = pg_backup_targets(r#"psql -d shop -c "DROP TABLE users""#)
+            .expect("a drop is insurable");
         assert_eq!(tables, ["users"]);
         assert!(
             !data_only,
@@ -805,7 +808,12 @@ mod tests {
         );
         git_run(
             &work,
-            &["remote", "add", "origin", remote.to_str().expect("utf-8 path")],
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("utf-8 path"),
+            ],
         );
         std::fs::write(work.join("seed.txt"), "seed\n").expect("file must be writable");
         git_run(&work, &["add", "-A"]);
@@ -942,7 +950,9 @@ mod tests {
             .expect("a truncate is insurable");
 
         assert_eq!(record.kind, "pg-dump");
-        let file = record.data["file"].as_str().expect("the record names a file");
+        let file = record.data["file"]
+            .as_str()
+            .expect("the record names a file");
         assert!(
             Path::new(file).is_file(),
             "the record must name a dump that exists: {file}"

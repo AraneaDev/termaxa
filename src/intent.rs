@@ -1119,7 +1119,11 @@ mod tests {
 
     #[test]
     fn infrastructure_teardown_is_recognised_by_its_verb() {
-        for command in ["terraform destroy", "tofu destroy", "kubectl delete pod web"] {
+        for command in [
+            "terraform destroy",
+            "tofu destroy",
+            "kubectl delete pod web",
+        ] {
             assert_eq!(
                 classify_command(command),
                 Some(Intent::InfraDestroy),
@@ -1156,7 +1160,11 @@ mod tests {
             let pad = LINE - 1 - base.len();
             entry["pad"] = serde_json::Value::String("x".repeat(pad));
             let line = serde_json::to_string(&entry).expect("entry must serialize");
-            assert_eq!(line.len(), LINE - 1, "every line must be exactly {LINE} bytes");
+            assert_eq!(
+                line.len(),
+                LINE - 1,
+                "every line must be exactly {LINE} bytes"
+            );
             out.push_str(&line);
             out.push('\n');
         }
@@ -1196,8 +1204,9 @@ mod tests {
             "version: 1\ndefault: ask\nrules: []\ncircuit_breaker:\n  enabled: true\n  threshold: 5\n",
         );
 
-        let (intent, prior, _reason) = maybe_trip(&policy, &log, Some("sess-1"), "rm -rf ./another")
-            .expect("dozens of prior denied attempts is well past a threshold of 5");
+        let (intent, prior, _reason) =
+            maybe_trip(&policy, &log, Some("sess-1"), "rm -rf ./another")
+                .expect("dozens of prior denied attempts is well past a threshold of 5");
         assert_eq!(intent, Intent::FileDelete);
         assert!(
             prior >= 60,

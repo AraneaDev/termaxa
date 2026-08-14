@@ -141,7 +141,13 @@ fn a_denied_command_never_causes_the_preview_to_run_anything() {
 
     // The other half: liveness is decided by the verdict, not switched off
     // altogether. A command that was not denied still gets a live preview.
-    run_termaxa(&home, &proj, &["check", "terraform apply"], "", Some(&bin_dir));
+    run_termaxa(
+        &home,
+        &proj,
+        &["check", "terraform apply"],
+        "",
+        Some(&bin_dir),
+    );
     assert!(
         marker.exists(),
         "an undenied command should still be previewed live"
@@ -153,7 +159,12 @@ fn log_filters_by_decision_and_by_source() {
     let tmp = scratch("log-filter");
     let (home, proj) = (tmp.join("home"), project(&tmp));
 
-    termaxa(&home, &proj, &["check", "rm -rf /nonexistent-tmx-fixture"], "");
+    termaxa(
+        &home,
+        &proj,
+        &["check", "rm -rf /nonexistent-tmx-fixture"],
+        "",
+    );
     termaxa(&home, &proj, &["check", "cat notes.txt"], "");
     termaxa(&home, &proj, &["run", "--", "sh", "-c", "exit 0"], "");
 
@@ -195,9 +206,24 @@ fn stats_ranks_the_commands_that_were_denied() {
     let tmp = scratch("stats");
     let (home, proj) = (tmp.join("home"), project(&tmp));
 
-    termaxa(&home, &proj, &["check", "rm -rf /nonexistent-tmx-fixture"], "");
-    termaxa(&home, &proj, &["check", "rm -rf /nonexistent-tmx-fixture"], "");
-    termaxa(&home, &proj, &["check", "rm -rf /nonexistent-tmx-other"], "");
+    termaxa(
+        &home,
+        &proj,
+        &["check", "rm -rf /nonexistent-tmx-fixture"],
+        "",
+    );
+    termaxa(
+        &home,
+        &proj,
+        &["check", "rm -rf /nonexistent-tmx-fixture"],
+        "",
+    );
+    termaxa(
+        &home,
+        &proj,
+        &["check", "rm -rf /nonexistent-tmx-other"],
+        "",
+    );
     termaxa(&home, &proj, &["check", "cat notes.txt"], "");
 
     let stats = termaxa(&home, &proj, &["stats"], "").stdout;
@@ -268,7 +294,12 @@ fn rollback_refuses_an_id_it_does_not_have() {
 
     // A backup exists, so "not found" cannot be reached by having none.
     let out = termaxa(&home, &proj, &["rollback", "definitely-not-an-id"], "y\n");
-    assert_eq!(out.code, 2, "an unknown id is an error: {out:?}", out = out.stderr);
+    assert_eq!(
+        out.code,
+        2,
+        "an unknown id is an error: {out:?}",
+        out = out.stderr
+    );
     assert!(
         out.stderr.contains("no backup with id"),
         "and says so: {:?}",
@@ -284,11 +315,7 @@ fn rollback_restores_nothing_unless_it_is_confirmed() {
 
     let out = termaxa(&home, &proj, &["rollback", &id], "n\n");
     assert_eq!(out.code, 1, "a decline is not a success");
-    assert!(
-        out.stderr.contains("rollback declined"),
-        "{:?}",
-        out.stderr
-    );
+    assert!(out.stderr.contains("rollback declined"), "{:?}", out.stderr);
     assert!(
         !proj.join("doomed.txt").exists(),
         "declining must leave the file deleted, not restore it"
@@ -296,7 +323,11 @@ fn rollback_restores_nothing_unless_it_is_confirmed() {
 
     // And confirming does restore it, so the guard is a gate rather than a wall.
     let out = termaxa(&home, &proj, &["rollback", &id], "y\n");
-    assert_eq!(out.code, 0, "a confirmed rollback succeeds: {:?}", out.stderr);
+    assert_eq!(
+        out.code, 0,
+        "a confirmed rollback succeeds: {:?}",
+        out.stderr
+    );
     assert!(
         proj.join("doomed.txt").exists(),
         "the insured file must come back"
