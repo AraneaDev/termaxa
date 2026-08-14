@@ -535,6 +535,390 @@ fn short(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::intent::Intent;
+    use crate::testutil::TempTree;
+
+    /// One audit line. Tests override only the fields they are about, so the
+    /// thing under test is visible in the test rather than in the fixture.
+    fn entry(decision: &str, command: &str) -> AuditEntry {
+        AuditEntry {
+            ts_ms: 0,
+            ts: "2026-01-01T00:00:00Z".into(),
+            source: "hook".into(),
+            command: command.into(),
+            decision: decision.into(),
+            matched_rule: None,
+            reason: "because".into(),
+            signals: Vec::new(),
+            escalated: false,
+            session: None,
+            backup: None,
+            preview: None,
+            intent: None,
+            approved: None,
+            exit_code: None,
+            cwd: "/work/proj".into(),
+        }
+    }
+
+    fn paths_in(tmp: &TempTree) -> Paths {
+        Paths {
+            project_dir: tmp.dir("proj/.termaxa"),
+            state_dir: tmp.dir("state"),
+        }
+    }
+
+    /// `compute` over a fresh state dir. The tree is returned so it outlives
+    /// the report; dropping it early would delete the manifest under it.
+    fn compute_for(entries: &[AuditEntry]) -> (Report, TempTree) {
+        let tmp = TempTree::new("report");
+        let paths = paths_in(&tmp);
+        let refs: Vec<&AuditEntry> = entries.iter().collect();
+        let report = compute(&refs, &paths).expect("compute must succeed");
+        (report, tmp)
+    }
+
+    fn n_of(decision: &str, n: usize) -> Vec<AuditEntry> {
+        (0..n)
+            .map(|i| entry(decision, &format!("{decision}{i}")))
+            .collect()
+    }
+
+    #[test]
+    fn decision_counts_and_the_risk_formula_are_exact() {
+        // 1 deny, 3 escalated, 5 ask: chosen so that every coefficient and
+        // every operator in deny×3 + escalated×2 + ask×1 changes the answer
+        // if it is swapped. Equal counts would let ×2 and +2 agree.
+        let mut entries = vec![entry("deny", "rm -rf /")];
+        entries.extend(n_of("ask", 5));
+        for i in 0..3 {
+            let mut e = entry("allow", &format!("escalated{i}"));
+            e.escalated = true;
+            entries.push(e);
+        }
+
+        let (r, _tree) = compute_for(&entries);
+        assert_eq!(
+            (r.total, r.allow, r.ask, r.deny, r.escalated),
+            (9, 3, 5, 1, 3)
+        );
+        assert_eq!(r.risk_score, 3 + 6 + 5);
+        assert_eq!(r.risk_label, "High");
+        assert_eq!(r.auto_flow, r.allow, "auto-flow is the uninterrupted count");
+    }
+
+    #[test]
+    fn the_risk_bands_are_pinned_at_their_boundaries() {
+        // One ask is one point, so the count IS the score here.
+        for (asks, label) in [(0, "Low"), (2, "Low"), (3, "Medium"), (7, "Medium"), (8, "High")] {
+            let mut entries = vec![entry("allow", "ls")];
+            entries.extend(n_of("ask", asks));
+            let (r, _tree) = compute_for(&entries);
+            assert_eq!(
+                (r.risk_score, r.risk_label),
+                (asks as u32, label),
+                "{asks} asks should read as {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_lists_denials_and_impacts_skip_what_simply_ran() {
+        let mut denied = entry("deny", "drop table users");
+        denied.preview = Some("DROP TABLE users".into());
+        let mut allowed = entry("allow", "select 1");
+        allowed.preview = Some("SELECT 1 row".into());
+        let mut asked = entry("ask", "delete from sessions");
+        asked.preview = Some("DELETE ~120,000 rows".into());
+
+        let (r, _tree) = compute_for(&[allowed, denied, asked]);
+        assert_eq!(r.blocked, ["drop table users"]);
+        // An allow's preview is not an intervention point: nothing intervened.
+        assert_eq!(r.impacts, ["DROP TABLE users", "DELETE ~120,000 rows"]);
+    }
+
+    #[test]
+    fn a_rollback_is_a_post_receipt_that_names_a_rollback() {
+        let mut receipt = entry("allow", "termaxa rollback abc123");
+        receipt.source = "post".into();
+        let mut other_receipt = entry("allow", "ls -la");
+        other_receipt.source = "post".into();
+        // Two of these: a single one would let "not a post receipt" score the
+        // same as the real rule and hide the swap.
+        let asked_once = entry("ask", "termaxa rollback def456");
+        let asked_twice = entry("ask", "termaxa rollback ghi789");
+
+        let (r, _tree) = compute_for(&[receipt, other_receipt, asked_once, asked_twice]);
+        assert_eq!(
+            r.rollbacks, 1,
+            "both halves hold: a post receipt AND a rollback command"
+        );
+    }
+
+    #[test]
+    fn intents_count_classifications_while_trips_count_blocks() {
+        let breaker = crate::intent::BREAKER_RULE;
+        let tripped = |command: &str, label: &str| {
+            let mut e = entry("deny", command);
+            e.matched_rule = Some(breaker.into());
+            e.intent = Some(label.into());
+            e
+        };
+        // Classified but never blocked: legitimate destructive work.
+        let mut ordinary = entry("allow", "rm -rf ./build");
+        ordinary.intent = Some("file-delete".into());
+
+        let (r, _tree) = compute_for(&[
+            tripped("rm -rf /", "file-delete"),
+            tripped("rm -rf /etc", "file-delete"),
+            ordinary,
+            tripped("drop database prod", "db-destroy"),
+        ]);
+
+        assert_eq!(r.breaker_trips, 3);
+        assert_eq!(
+            r.intents,
+            [("file-delete".to_string(), 3), ("db-destroy".to_string(), 1)],
+            "intents count every classification, blocked or not"
+        );
+        assert_eq!(
+            r.trips_by_intent,
+            [("file-delete".to_string(), 2), ("db-destroy".to_string(), 1)],
+            "trips count only what the breaker actually stopped"
+        );
+    }
+
+    #[test]
+    fn equally_frequent_intents_are_ordered_alphabetically() {
+        // Ties have to break somewhere, or the report reorders itself between
+        // runs on identical data.
+        let with_intent = |label: &str| {
+            let mut e = entry("allow", "cmd");
+            e.intent = Some(label.into());
+            e
+        };
+        let (r, _tree) = compute_for(&[
+            with_intent("git-destructive"),
+            with_intent("db-destroy"),
+            with_intent("infra-destroy"),
+        ]);
+        let labels: Vec<&str> = r.intents.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["db-destroy", "git-destructive", "infra-destroy"]);
+    }
+
+    #[test]
+    fn recent_events_are_the_last_six_oldest_first() {
+        let entries = n_of("allow", 8);
+        let (r, _tree) = compute_for(&entries);
+
+        let commands: Vec<&str> = r.recent.iter().map(|(_, c)| c.as_str()).collect();
+        assert_eq!(
+            commands,
+            ["allow2", "allow3", "allow4", "allow5", "allow6", "allow7"]
+        );
+        assert!(r.recent[0].0.contains('✓'), "an allow is marked as success");
+    }
+
+    #[test]
+    fn the_window_spans_the_first_and_last_entry() {
+        let mut first = entry("allow", "first");
+        first.ts_ms = 60_000;
+        first.ts = "2026-01-01T00:01:00Z".into();
+        let mut last = entry("allow", "last");
+        last.ts_ms = 60_000 * 8;
+        last.ts = "2026-01-01T00:08:00Z".into();
+
+        let (r, _tree) = compute_for(&[first, last]);
+        assert_eq!(r.duration_min, 7);
+        assert_eq!(r.first_ts, "2026-01-01T00:01:00Z");
+        assert_eq!(r.last_ts, "2026-01-01T00:08:00Z");
+    }
+
+    #[test]
+    fn a_clock_that_went_backwards_reports_no_duration() {
+        // saturating_sub: a line stamped before its predecessor must not
+        // underflow into a duration of half a billion years.
+        let mut first = entry("allow", "first");
+        first.ts_ms = 60_000 * 8;
+        let mut last = entry("allow", "last");
+        last.ts_ms = 60_000;
+
+        let (r, _tree) = compute_for(&[first, last]);
+        assert_eq!(r.duration_min, 0);
+    }
+
+    #[test]
+    fn backups_are_joined_against_the_manifest_and_unknown_ids_dropped() {
+        let tmp = TempTree::new("report-backups");
+        let paths = paths_in(&tmp);
+        let manifest = tmp.dir("state/backups").join("manifest.jsonl");
+        std::fs::write(
+            &manifest,
+            "{\"id\":\"b1\",\"ts\":\"t\",\"kind\":\"pg-dump\",\"command\":\"psql\",\
+             \"data\":{},\"note\":\"dump of sessions\"}\n",
+        )
+        .expect("manifest must be writable");
+
+        let mut insured = entry("allow", "psql -c 'truncate sessions'");
+        insured.backup = Some("b1".into());
+        let mut dangling = entry("allow", "psql -c 'truncate users'");
+        // An id with no manifest record must not invent a backup line.
+        dangling.backup = Some("b404".into());
+
+        let refs = vec![&insured, &dangling];
+        let r = compute(&refs, &paths).expect("compute must succeed");
+        assert_eq!(
+            r.backups,
+            [("pg-dump".to_string(), "dump of sessions".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_rollup_window_excludes_what_fell_out_of_it() {
+        let now = crate::audit::now().0;
+        let day_ms: u128 = 24 * 60 * 60 * 1000;
+
+        let mut fresh = entry("allow", "fresh");
+        fresh.ts_ms = now;
+        fresh.session = Some("s1".into());
+        fresh.backup = Some("b1".into());
+        let mut stale = entry("deny", "stale");
+        stale.ts_ms = now - 31 * day_ms;
+        stale.session = Some("s2".into());
+
+        let roll = compute_rollup(&[stale, fresh], 30);
+        assert_eq!(roll.days, 30);
+        assert_eq!(
+            (roll.commands, roll.sessions, roll.allow, roll.ask, roll.deny),
+            (1, 1, 1, 0, 0),
+            "the entry from 31 days ago is outside a 30-day window"
+        );
+        assert_eq!(roll.backups, 1);
+    }
+
+    #[test]
+    fn the_rollup_cutoff_is_exactly_the_window_in_days() {
+        // Days have to be converted to milliseconds by multiplication, all the
+        // way down. Any other arithmetic lands the cutoff hours or minutes ago
+        // instead of days, so an entry well inside the window falls out of it
+        // — which is what these two entries are placed to detect.
+        let now = crate::audit::now().0;
+        let day_ms: u128 = 24 * 60 * 60 * 1000;
+        let at = |ago: u128, command: &str| {
+            let mut e = entry("allow", command);
+            e.ts_ms = now - ago * day_ms;
+            e
+        };
+
+        let roll = compute_rollup(&[at(9, "outside"), at(5, "inside")], 7);
+        assert_eq!(
+            roll.commands, 1,
+            "five days ago is inside a seven-day window and nine days ago is not"
+        );
+    }
+
+    #[test]
+    fn the_rollup_counts_breaker_trips_not_everything_else() {
+        let now = crate::audit::now().0;
+        let tripped = |command: &str| {
+            let mut e = entry("deny", command);
+            e.ts_ms = now;
+            e.matched_rule = Some(crate::intent::BREAKER_RULE.into());
+            e
+        };
+        let mut ordinary = entry("allow", "ls");
+        ordinary.ts_ms = now;
+        ordinary.matched_rule = Some("allow-listing".into());
+
+        // Two and one, not one and one: equal counts would let "everything
+        // that is NOT a trip" score the same as the real rule.
+        let roll = compute_rollup(&[tripped("rm -rf /"), tripped("rm -rf /etc"), ordinary], 30);
+        assert_eq!(roll.breaker_trips, 2);
+    }
+
+    #[test]
+    fn the_rollup_ranks_the_busiest_directories_by_basename() {
+        let now = crate::audit::now().0;
+        let in_dir = |cwd: &str| {
+            let mut e = entry("allow", "cmd");
+            e.ts_ms = now;
+            e.cwd = cwd.into();
+            e
+        };
+        let mut entries: Vec<AuditEntry> = Vec::new();
+        for _ in 0..3 {
+            entries.push(in_dir("/work/alpha"));
+        }
+        for _ in 0..2 {
+            entries.push(in_dir("/work/beta/"));
+        }
+        entries.push(in_dir("C:\\work\\gamma"));
+        entries.push(in_dir("/work/delta"));
+        // A root cwd has no basename to report and must not become an entry.
+        entries.push(in_dir("/"));
+
+        let roll = compute_rollup(&entries, 30);
+        assert_eq!(roll.top_dirs.len(), 3, "at most three are shown");
+        assert_eq!(&roll.top_dirs[..2], ["alpha", "beta"], "busiest first");
+        assert!(
+            !roll.top_dirs.contains(&String::new()),
+            "a nameless directory is not a directory: {:?}",
+            roll.top_dirs
+        );
+    }
+
+    #[test]
+    fn a_session_label_is_shortened_for_display() {
+        assert_eq!(short("0123456789abcdef"), "session 01234567");
+        // Shorter than the cut is left whole rather than panicking on a slice.
+        assert_eq!(short("abc"), "session abc");
+    }
+
+    #[test]
+    fn a_report_with_no_activity_says_so_and_still_succeeds() {
+        let tmp = TempTree::new("report-empty");
+        let paths = paths_in(&tmp);
+        assert_eq!(
+            run(&paths, Scope::default(), false).expect("an empty log is not an error"),
+            0
+        );
+    }
+
+    #[test]
+    fn asking_for_a_session_that_is_not_there_fails_rather_than_reporting_everything() {
+        let tmp = TempTree::new("report-session");
+        let paths = paths_in(&tmp);
+        let log = AuditLog::new(&paths.state_dir).expect("log must be creatable");
+        for command in ["one", "two"] {
+            let mut e = entry("allow", command);
+            e.session = Some("abc12345".into());
+            log.append(&e).expect("append must succeed");
+        }
+
+        let scope = Scope {
+            session: Some("nope".into()),
+            ..Scope::default()
+        };
+        assert_eq!(
+            run(&paths, scope, false).expect("an empty scope is not an error"),
+            1,
+            "a scope with nothing in it must not report the whole log instead"
+        );
+
+        // The same log, scoped the ordinary way, is a report.
+        assert_eq!(run(&paths, Scope::default(), true).unwrap(), 0);
+        assert_eq!(
+            run(
+                &paths,
+                Scope {
+                    all: true,
+                    ..Scope::default()
+                },
+                false
+            )
+            .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn post_receipt_renders_as_success_not_denial() {
