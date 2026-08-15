@@ -717,6 +717,9 @@ mod tests {
         assert_eq!(psql_program(&shell_tokens("evilpsql -c 'x'")), None);
     }
 
+    // All three users are #[cfg(unix)] (they need shell stub binaries), so on
+    // Windows this import is unused and -D warnings makes it fatal.
+    #[cfg(unix)]
     use crate::testutil::TempTree;
 
     // -----------------------------------------------------------------------
