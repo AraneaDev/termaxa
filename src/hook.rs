@@ -632,7 +632,13 @@ pub fn run() -> Result<()> {
         // A denied command must not cause a subprocess. The preview is still
         // generated — statically — so the denial reason keeps its detail.
         let live = decision.action != crate::policy::Action::Deny;
-        crate::preview::generate(&command, paths.project_dir.parent(), live).map(|p| p.summary)
+        crate::preview::generate(
+            &command,
+            paths.project_dir.parent(),
+            std::path::Path::new(&input.cwd),
+            live,
+        )
+        .map(|p| p.summary)
     };
 
     // Insure before allowing: PreToolUse runs before execution, so a backup
@@ -660,7 +666,9 @@ pub fn run() -> Result<()> {
 
     let mut backup_id: Option<String> = None;
     if !is_probe && decision.action != Action::Deny {
-        if let Ok(Some(rec)) = crate::backup::take(&paths.state_dir, &command) {
+        if let Ok(Some(rec)) =
+            crate::backup::take(&paths.state_dir, &command, std::path::Path::new(&input.cwd))
+        {
             backup_id = Some(rec.id);
         }
     }

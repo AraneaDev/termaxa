@@ -220,8 +220,17 @@ fn dispatch(cli: Cli) -> Result<i32> {
 
             let mut preview_summary = None;
             let root = resolved.as_ref().and_then(|p| p.project_dir.parent());
-            if let Some(pv) = preview::generate(&cmd, root, decision.action != policy::Action::Deny)
-            {
+            // `check` runs in the user's own shell, so the process cwd IS the
+            // base the command would resolve against — threaded explicitly so
+            // that reasoning is visible rather than ambient (v0.16 item 1).
+            let check_cwd =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            if let Some(pv) = preview::generate(
+                &cmd,
+                root,
+                &check_cwd,
+                decision.action != policy::Action::Deny,
+            ) {
                 println!("\n{}", ui::bold(&pv.title));
                 for l in &pv.lines {
                     println!("{}", l);

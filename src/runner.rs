@@ -38,9 +38,14 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
         "run",
     );
 
+    // The runner executes the command itself, so ITS process cwd is the
+    // correct resolution base — unlike the hook, whose process cwd is the
+    // harness's, not the command's. Threaded explicitly so that distinction
+    // is visible rather than relying on an ambient default inside resolve.
+    let run_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut backup_id: Option<String> = None;
     let insure = |backup_id: &mut Option<String>| {
-        match crate::backup::take(&paths.state_dir, &command) {
+        match crate::backup::take(&paths.state_dir, &command, &run_cwd) {
             Ok(Some(rec)) => {
                 println!("🛟 backup {} — {}", rec.id, rec.note);
                 *backup_id = Some(rec.id);
@@ -54,7 +59,8 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
     };
 
     let root = paths.project_dir.parent();
-    let preview_summary = crate::preview::generate(&command, root, true).map(|p| p.summary);
+    let preview_summary =
+        crate::preview::generate(&command, root, &run_cwd, true).map(|p| p.summary);
 
     let (approved, exit_code) = match decision.action {
         Action::Deny => {
@@ -62,7 +68,7 @@ pub fn run(paths: &crate::paths::Paths, argv: &[String]) -> Result<i32> {
             (Some(false), None)
         }
         Action::Ask => {
-            if let Some(pv) = crate::preview::generate(&command, root, true) {
+            if let Some(pv) = crate::preview::generate(&command, root, &run_cwd, true) {
                 println!("┌ {}", pv.title);
                 for l in &pv.lines {
                     println!("│{}", l);

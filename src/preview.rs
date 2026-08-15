@@ -42,22 +42,27 @@ pub struct Preview {
 /// preview never spawns anything. It is to make "may this execute?" an
 /// argument, so the caller that already knows the verdict decides.
 /// Reported by Tim Schipper.
-pub fn generate(command: &str, root: Option<&std::path::Path>, live: bool) -> Option<Preview> {
+pub fn generate(
+    command: &str,
+    root: Option<&std::path::Path>,
+    cwd: &std::path::Path,
+    live: bool,
+) -> Option<Preview> {
     // Deletes are checked across the whole command first: a compound like
     // `mkdir x && rm -rf /` must not have its delete masked by an earlier
     // segment producing a preview.
-    if let Some(p) = crate::delete::preview_for(command, root) {
+    if let Some(p) = crate::delete::preview_for(command, root, cwd) {
         return Some(p);
     }
     // Compound commands: preview the first segment that has one.
     let segments = crate::shell::split_segments(command);
     if segments.len() > 1 {
-        return segments.iter().find_map(|s| generate_one(s, live));
+        return segments.iter().find_map(|s| generate_one(s, cwd, live));
     }
-    generate_one(command, live)
+    generate_one(command, cwd, live)
 }
 
-fn generate_one(command: &str, live: bool) -> Option<Preview> {
+fn generate_one(command: &str, cwd: &std::path::Path, live: bool) -> Option<Preview> {
     let cmd = crate::policy::normalize(command);
     if cmd.starts_with("git push") {
         // Entirely subprocess-derived: `git rev-parse`, `git log`. Nothing
@@ -65,7 +70,7 @@ fn generate_one(command: &str, live: bool) -> Option<Preview> {
         return if live { git_push_preview(&cmd) } else { None };
     }
     if cmd.starts_with("psql") || cmd.contains(" psql ") {
-        return crate::pg::preview_for(command, live);
+        return crate::pg::preview_for(command, cwd, live);
     }
     for bin in ["terraform", "tofu"] {
         if cmd.starts_with(&format!("{} apply", bin))
@@ -410,7 +415,8 @@ mod push_preview_tests {
     }
 
     fn preview_of(command: &str) -> Preview {
-        generate(command, None, true).expect("a live push preview should exist in a repo")
+        generate(command, None, std::path::Path::new("."), true)
+            .expect("a live push preview should exist in a repo")
     }
 
     #[test]
@@ -694,8 +700,13 @@ mod terraform_stub_tests {
 
         // Both verbs are gated the same way; capture before restoring so a
         // failing assertion cannot leave PATH rewritten for the whole process.
-        let apply = generate("terraform apply -auto-approve", None, true);
-        let destroy = generate("terraform destroy", None, true);
+        let apply = generate(
+            "terraform apply -auto-approve",
+            None,
+            std::path::Path::new("."),
+            true,
+        );
+        let destroy = generate("terraform destroy", None, std::path::Path::new("."), true);
 
         match previous {
             Some(p) => std::env::set_var("PATH", p),
@@ -720,14 +731,26 @@ mod live_gate_tests {
     /// more correctly the gate behaved, the more confidently it ran the plan.
     #[test]
     fn a_non_live_preview_spawns_nothing_for_terraform() {
-        assert!(generate("terraform destroy -auto-approve", None, false).is_none());
-        assert!(generate("tofu destroy", None, false).is_none());
+        assert!(generate(
+            "terraform destroy -auto-approve",
+            None,
+            std::path::Path::new("."),
+            false
+        )
+        .is_none());
+        assert!(generate("tofu destroy", None, std::path::Path::new("."), false).is_none());
     }
 
     /// Same structure, the other two subprocess previews.
     #[test]
     fn a_non_live_preview_spawns_nothing_for_git_push() {
-        assert!(generate("git push --force origin main", None, false).is_none());
+        assert!(generate(
+            "git push --force origin main",
+            None,
+            std::path::Path::new("."),
+            false
+        )
+        .is_none());
     }
 
     /// The reason NOT to simply skip the preview on deny: static analysis is
@@ -736,8 +759,13 @@ mod live_gate_tests {
     /// database it was just blocked from.
     #[test]
     fn a_non_live_preview_keeps_the_static_sql_analysis() {
-        let p = generate(r#"psql -d shop -c "DROP TABLE users""#, None, false)
-            .expect("static SQL analysis must still produce a preview");
+        let p = generate(
+            r#"psql -d shop -c "DROP TABLE users""#,
+            None,
+            std::path::Path::new("."),
+            false,
+        )
+        .expect("static SQL analysis must still produce a preview");
         assert!(
             p.summary.contains("users"),
             "denial reason lost its detail: {}",
@@ -750,8 +778,13 @@ mod live_gate_tests {
     /// is not a psql command, but half of it is.
     #[test]
     fn a_compound_command_is_previewed_by_its_first_meaningful_segment() {
-        let p = generate(r#"echo hi;psql -d shop -c "DROP TABLE users""#, None, false)
-            .expect("the segment carrying a preview must be found");
+        let p = generate(
+            r#"echo hi;psql -d shop -c "DROP TABLE users""#,
+            None,
+            std::path::Path::new("."),
+            false,
+        )
+        .expect("the segment carrying a preview must be found");
         assert!(
             p.summary.contains("users"),
             "the segment's own analysis is what surfaces: {}",
@@ -763,8 +796,18 @@ mod live_gate_tests {
     /// asserted so a future refactor can't quietly gate them too.
     #[test]
     fn deletes_preview_identically_whether_live_or_not() {
-        let live = generate("rm -rf /tmp/tmx-none-such", None, true);
-        let stat = generate("rm -rf /tmp/tmx-none-such", None, false);
+        let live = generate(
+            "rm -rf /tmp/tmx-none-such",
+            None,
+            std::path::Path::new("."),
+            true,
+        );
+        let stat = generate(
+            "rm -rf /tmp/tmx-none-such",
+            None,
+            std::path::Path::new("."),
+            false,
+        );
         assert_eq!(live.map(|p| p.summary), stat.map(|p| p.summary));
     }
 }

@@ -29,10 +29,15 @@ pub struct BackupRecord {
 }
 
 /// What WOULD be backed up for this command — used by previews.
-pub fn plan(command: &str) -> Option<String> {
+/// Takes an explicit `cwd` because it filters candidate paths by `exists()`:
+/// resolved against the wrong directory, an insurable command reports as
+/// uninsurable and the preview tells a human "not reversible without a
+/// backup" about a file that would in fact be copied aside. A preview whose
+/// lines are meant to be facts cannot resolve against the process cwd.
+pub fn plan(command: &str, cwd: &Path) -> Option<String> {
     let segments = crate::shell::split_segments(command);
     if segments.len() > 1 {
-        return segments.iter().find_map(|s| plan(s));
+        return segments.iter().find_map(|s| plan(s, cwd));
     }
     let tokens = crate::pg::shell_tokens(command);
     if let Some((remote, branch)) = git_force_push_target(&tokens) {
@@ -52,7 +57,7 @@ pub fn plan(command: &str) -> Option<String> {
             }
         ));
     }
-    if let Some(paths) = rm_targets(&tokens) {
+    if let Some(paths) = rm_targets(&tokens, cwd) {
         return Some(format!(
             "copy {} path(s) to .termaxa/backups before deletion",
             paths.len()
@@ -87,11 +92,11 @@ fn tf_state_target(tokens: &[String]) -> Option<PathBuf> {
 
 /// Take the backup. Returns the record on success, a printable error string
 /// on a failed attempt, or Ok(None) when the command needs no insurance.
-pub fn take(termaxa_dir: &Path, command: &str) -> Result<Option<BackupRecord>> {
+pub fn take(termaxa_dir: &Path, command: &str, cwd: &Path) -> Result<Option<BackupRecord>> {
     let segments = crate::shell::split_segments(command);
     if segments.len() > 1 {
         for s in &segments {
-            if let Some(rec) = take(termaxa_dir, s)? {
+            if let Some(rec) = take(termaxa_dir, s, cwd)? {
                 return Ok(Some(rec)); // insure the first insurable segment
             }
         }
@@ -105,11 +110,11 @@ pub fn take(termaxa_dir: &Path, command: &str) -> Result<Option<BackupRecord>> {
         backup_git_ref(&id, &ts, command, &remote, &branch)?
     } else if let Some((tables, data_only)) = pg_backup_targets(command) {
         backup_pg(termaxa_dir, &id, &ts, command, &tokens, &tables, data_only)?
-    } else if let Some(paths) = rm_targets(&tokens) {
+    } else if let Some(paths) = rm_targets(&tokens, cwd) {
         backup_files(termaxa_dir, &id, &ts, command, &paths)?
     } else if let Some(state) = tf_state_target(&tokens) {
         backup_files(termaxa_dir, &id, &ts, command, &[state])?
-    } else if let Some(paths) = overwrite_targets(command) {
+    } else if let Some(paths) = overwrite_targets(command, cwd) {
         backup_files(termaxa_dir, &id, &ts, command, &paths)?
     } else {
         return Ok(None);
@@ -313,11 +318,11 @@ fn backup_pg(
 /// Only files that already EXIST are insurable. `> newfile` creates rather than
 /// destroys, and backing up a path with no contents is noise in the manifest.
 /// Appends (`>>`) are excluded upstream by `Overwrite::truncates`.
-fn overwrite_targets(command: &str) -> Option<Vec<PathBuf>> {
+fn overwrite_targets(command: &str, cwd: &Path) -> Option<Vec<PathBuf>> {
     let paths: Vec<PathBuf> = crate::shell::redirect_targets(command)
         .into_iter()
         .filter(|o| o.truncates)
-        .map(|o| crate::delete::resolve_path(&o.target))
+        .map(|o| crate::delete::resolve_path_in(&o.target, cwd))
         .filter(|p| p.is_file())
         .collect();
     if paths.is_empty() {
@@ -327,7 +332,7 @@ fn overwrite_targets(command: &str) -> Option<Vec<PathBuf>> {
     }
 }
 
-fn rm_targets(tokens: &[String]) -> Option<Vec<PathBuf>> {
+fn rm_targets(tokens: &[String], cwd: &Path) -> Option<Vec<PathBuf>> {
     let head = crate::delete::command_head(tokens.first()?);
     if !crate::delete::is_delete_command(&head) {
         return None;
@@ -335,7 +340,7 @@ fn rm_targets(tokens: &[String]) -> Option<Vec<PathBuf>> {
     let paths: Vec<PathBuf> = tokens[1..]
         .iter()
         .filter(|t| !crate::delete::is_flag(&head, t))
-        .map(|t| crate::delete::resolve_path(t))
+        .map(|t| crate::delete::resolve_path_in(t, cwd))
         .filter(|p| p.exists())
         .collect();
     if paths.is_empty() {
@@ -514,6 +519,13 @@ fn git_out(args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests resolve against the process cwd deliberately: they build their
+    /// fixtures with absolute paths, so the base is irrelevant to them. The
+    /// point of the parameter is that PRODUCTION never uses this.
+    fn test_cwd() -> std::path::PathBuf {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    }
     /// #14. The insurance half: an overwrite that is not denied must still be
     /// recoverable, because "agents write files constantly" is exactly why the
     /// gate cannot ask about every one.
@@ -525,7 +537,8 @@ mod tests {
         std::fs::write(&target, "original contents").unwrap();
 
         let cmd = format!("echo {{}} > {}", target.display());
-        let found = overwrite_targets(&cmd).expect("an existing file must be insurable");
+        let found =
+            overwrite_targets(&cmd, &test_cwd()).expect("an existing file must be insurable");
         assert_eq!(found.len(), 1);
         assert!(found[0].ends_with("config.json"));
     }
@@ -540,12 +553,15 @@ mod tests {
         std::fs::write(&existing, "log").unwrap();
 
         assert!(
-            overwrite_targets(&format!("echo x > {}", dir.join("brand-new.txt").display()))
-                .is_none(),
+            overwrite_targets(
+                &format!("echo x > {}", dir.join("brand-new.txt").display()),
+                &test_cwd(),
+            )
+            .is_none(),
             "> onto a path that does not exist creates rather than destroys"
         );
         assert!(
-            overwrite_targets(&format!("echo x >> {}", existing.display())).is_none(),
+            overwrite_targets(&format!("echo x >> {}", existing.display()), &test_cwd()).is_none(),
             ">> appends"
         );
     }
@@ -569,7 +585,7 @@ mod tests {
         // insurance mattered most was the one silently without it.
         let (_tmp, dir) = scratch("syntax");
         let win = dir.display().to_string();
-        let planned_win = plan(&format!("rm -rf {}", win)).is_some();
+        let planned_win = plan(&format!("rm -rf {}", win), &test_cwd()).is_some();
         assert!(planned_win, "an existing path must be insurable: {win}");
 
         #[cfg(windows)]
@@ -577,7 +593,7 @@ mod tests {
             // C:\Users\x\tmp  ->  /c/Users/x/tmp
             let bash = format!("/{}", win.replacen(':', "", 1).replace('\\', "/"));
             assert_eq!(
-                plan(&format!("rm -rf {}", bash)).is_some(),
+                plan(&format!("rm -rf {}", bash), &test_cwd()).is_some(),
                 planned_win,
                 "git-bash form must reach the same decision, got none for {bash}"
             );
@@ -593,23 +609,100 @@ mod tests {
         let (_tmp, dir) = scratch("shells");
         let p = dir.display().to_string();
 
-        assert!(plan(&format!("Remove-Item -Recurse -Force {}", p)).is_some());
-        assert!(plan(&format!("del /s /q {}", p)).is_some());
-        assert!(plan(&format!("rmdir /s {}", p)).is_some());
-        assert!(plan(&format!("rm -rf {}", p)).is_some());
+        assert!(plan(&format!("Remove-Item -Recurse -Force {}", p), &test_cwd()).is_some());
+        assert!(plan(&format!("del /s /q {}", p), &test_cwd()).is_some());
+        assert!(plan(&format!("rmdir /s {}", p), &test_cwd()).is_some());
+        assert!(plan(&format!("rm -rf {}", p), &test_cwd()).is_some());
 
         // Non-deletes stay uninsured.
-        assert!(plan("git status").is_none());
-        assert!(plan(&format!("ls -la {}", p)).is_none());
+        assert!(plan("git status", &test_cwd()).is_none());
+        assert!(plan(&format!("ls -la {}", p), &test_cwd()).is_none());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// v0.16 item 1, the whole point of the parameter: a hook runs in
+    /// whatever directory the harness spawned it in, which is NOT the
+    /// directory the agent's command runs in. Before this, a relative target
+    /// resolved against the process cwd, found nothing, and took NO BACKUP —
+    /// silently, because "no such file" and "nothing to insure" are the same
+    /// answer. Both target kinds are covered: rm targets and redirect
+    /// overwrite targets.
+    #[test]
+    fn the_payload_cwd_governs_resolution_not_the_process_cwd() {
+        let tmp = TempTree::new("payload-cwd");
+        let project = tmp.dir("project");
+        let elsewhere = tmp.dir("elsewhere");
+        std::fs::write(project.join("doomed.txt"), "real content").unwrap();
+        std::fs::write(project.join("target.env"), "SECRET=1").unwrap();
+
+        // The process cwd is deliberately WRONG: neither file exists here.
+        assert!(!elsewhere.join("doomed.txt").exists());
+
+        let rm = rm_targets(
+            &[
+                "rm".to_string(),
+                "-rf".to_string(),
+                "doomed.txt".to_string(),
+            ],
+            &project,
+        )
+        .expect("a relative rm target must resolve against the PAYLOAD cwd");
+        assert_eq!(rm.len(), 1);
+        assert_eq!(rm[0], project.join("doomed.txt"));
+
+        let ov = overwrite_targets("cat /dev/null > target.env", &project)
+            .expect("a relative redirect target must resolve against the PAYLOAD cwd");
+        assert_eq!(ov.len(), 1);
+        assert_eq!(ov[0], project.join("target.env"));
+
+        // Control leg — without it this test cannot distinguish "resolved
+        // correctly" from "resolves everything to something". Against the
+        // wrong base the same command finds nothing, which is exactly the
+        // silent no-backup this parameter exists to prevent.
+        assert!(
+            rm_targets(
+                &[
+                    "rm".to_string(),
+                    "-rf".to_string(),
+                    "doomed.txt".to_string()
+                ],
+                &elsewhere,
+            )
+            .is_none(),
+            "control: the wrong base must find nothing, or the test proves nothing"
+        );
+        assert!(
+            overwrite_targets("cat /dev/null > target.env", &elsewhere).is_none(),
+            "control: the wrong base must find nothing for overwrites too"
+        );
+    }
+
+    /// `plan` filters by `exists()`, so a wrong base makes an insurable
+    /// command report as uninsurable — the preview then tells a human "not
+    /// reversible without a backup" about a file that WOULD be copied aside.
+    #[test]
+    fn plan_reports_insurance_against_the_payload_cwd() {
+        let tmp = TempTree::new("plan-cwd");
+        let project = tmp.dir("proj");
+        let elsewhere = tmp.dir("other");
+        std::fs::write(project.join("doomed.txt"), "x").unwrap();
+
+        assert!(
+            plan("rm -rf doomed.txt", &project).is_some(),
+            "insurable against the payload cwd"
+        );
+        assert!(
+            plan("rm -rf doomed.txt", &elsewhere).is_none(),
+            "control: the wrong base reports no insurance — the preview lie this prevents"
+        );
     }
 
     #[test]
     fn cmd_switches_are_not_treated_as_targets() {
         // `/s` must not be resolved as a path, and a nonexistent target must
         // not produce a plan merely because a switch was present.
-        assert!(plan("del /s /q C:\\definitely-not-here-xyz-9f2").is_none());
+        assert!(plan("del /s /q C:\\definitely-not-here-xyz-9f2", &test_cwd()).is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -740,8 +833,11 @@ mod tests {
     fn a_compound_command_is_planned_by_its_insurable_segment() {
         // The first segment insures nothing, which must not make the whole
         // command read as uninsurable.
-        let planned = plan(r#"echo hi && psql -d shop -c "TRUNCATE users""#)
-            .expect("the insurable segment must be found");
+        let planned = plan(
+            r#"echo hi && psql -d shop -c "TRUNCATE users""#,
+            &test_cwd(),
+        )
+        .expect("the insurable segment must be found");
         assert!(planned.contains("pg_dump"), "{planned}");
     }
 
@@ -751,9 +847,13 @@ mod tests {
         let state = tmp.dir("state");
         let doomed = tmp.file("doomed.txt", "precious");
 
-        let record = take(&state, &format!("echo hi && rm -rf {}", doomed.display()))
-            .expect("taking a backup must not fail")
-            .expect("the delete segment is insurable");
+        let record = take(
+            &state,
+            &format!("echo hi && rm -rf {}", doomed.display()),
+            &test_cwd(),
+        )
+        .expect("taking a backup must not fail")
+        .expect("the delete segment is insurable");
 
         assert_eq!(record.kind, "files");
         assert!(
@@ -929,7 +1029,7 @@ mod tests {
         let _guard = stub_on_path(&env, "pg_dump", 1);
         let state = env.root().join("state");
 
-        let err = take(&state, r#"psql -d shop -c "TRUNCATE users""#)
+        let err = take(&state, r#"psql -d shop -c "TRUNCATE users""#, &test_cwd())
             .expect_err("a dump that did not run is not a backup");
         assert!(err.to_string().contains("pg_dump failed"), "{err}");
         assert!(
@@ -945,7 +1045,7 @@ mod tests {
         let _guard = stub_on_path(&env, "pg_dump", 0);
         let state = env.root().join("state");
 
-        let record = take(&state, r#"psql -d shop -c "TRUNCATE users""#)
+        let record = take(&state, r#"psql -d shop -c "TRUNCATE users""#, &test_cwd())
             .expect("the dump must succeed")
             .expect("a truncate is insurable");
 
@@ -967,7 +1067,7 @@ mod tests {
         {
             // Take a real record first, with a dump that works.
             let _guard = stub_on_path(&env, "pg_dump", 0);
-            take(&state, r#"psql -d shop -c "TRUNCATE users""#)
+            take(&state, r#"psql -d shop -c "TRUNCATE users""#, &test_cwd())
                 .expect("the dump must succeed")
                 .expect("a truncate is insurable");
         }

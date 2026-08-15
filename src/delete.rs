@@ -56,7 +56,7 @@ const SENSITIVE: &[(&str, &str)] = &[
     (".netrc", "stored logins"),
 ];
 
-pub fn preview_for(command: &str, project_root: Option<&Path>) -> Option<Preview> {
+pub fn preview_for(command: &str, project_root: Option<&Path>, cwd: &Path) -> Option<Preview> {
     let targets = extract_targets(command);
     if targets.is_empty() {
         return None;
@@ -67,7 +67,7 @@ pub fn preview_for(command: &str, project_root: Option<&Path>) -> Option<Preview
     let mut worst_first: Vec<String> = Vec::new();
 
     for raw in targets.iter().take(3) {
-        let resolved = resolve_path(raw);
+        let resolved = resolve_path_in(raw, cwd);
         let display = resolved.display().to_string();
 
         lines.push(format!("  target      : {}", display));
@@ -136,7 +136,7 @@ pub fn preview_for(command: &str, project_root: Option<&Path>) -> Option<Preview
         // is ambiguous on its own: it could mean the backup engine does not
         // cover this command, or that the target is simply too big to copy.
         // A preview whose lines are meant to be facts has to say which.
-        match crate::backup::plan(command) {
+        match crate::backup::plan(command, cwd) {
             Some(plan) if !scan.capped => {
                 lines.push(format!("  insurance   : {} (automatic on run/hook)", plan));
             }
@@ -307,7 +307,15 @@ fn tokenize(s: &str) -> Vec<String> {
 /// path and is really `C:\Users\x`. That exact conversion is what the incident
 /// turned on — the agent wrote to `/c/Users/harih` believing it was a stray
 /// directory, when on Windows it resolves to the real profile.
-pub fn resolve_path(raw: &str) -> PathBuf {
+/// Resolve a raw target against an explicit base directory.
+///
+/// v0.16, decision #48's sibling: the base is a parameter, never the process
+/// cwd. A hook runs in whatever directory the harness spawned it in, which is
+/// not the directory the agent's command runs in — resolving a relative target
+/// against the wrong base silently found nothing and took no backup (the
+/// documented Cursor no-backup case). The payload carries the real cwd; every
+/// caller threads it here.
+pub fn resolve_path_in(raw: &str, cwd: &Path) -> PathBuf {
     let s = raw.trim().trim_matches('"').trim_matches('\'');
 
     // WSL: /mnt/c/... -> C:\...
@@ -343,13 +351,7 @@ pub fn resolve_path(raw: &str) -> PathBuf {
     }
 
     let p = PathBuf::from(s);
-    let joined = if p.is_absolute() {
-        p
-    } else if let Ok(cwd) = std::env::current_dir() {
-        cwd.join(p)
-    } else {
-        p
-    };
+    let joined = if p.is_absolute() { p } else { cwd.join(p) };
     normalise(joined)
 }
 
@@ -607,6 +609,14 @@ fn short(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The old process-cwd form, kept for tests only. Production has no
+    /// caller left: with every site threaded, `resolve_path` became dead
+    /// code and clippy said so, which is the cleanest possible proof that
+    /// the ambient fallback is gone (v0.16 item 1).
+    fn resolve_path_here(raw: &str) -> PathBuf {
+        resolve_path_in(raw, &std::env::current_dir().unwrap())
+    }
     use crate::testutil::TempTree;
 
     /// Schipper review, finding 2. Sweeps every length across non-ASCII
@@ -724,7 +734,7 @@ mod tests {
         // no C:, so the branch correctly never fires.
         #[cfg(windows)]
         {
-            let p = resolve_path("/c/Users/harih");
+            let p = resolve_path_here("/c/Users/harih");
             let s = p.to_string_lossy().to_lowercase();
             assert!(
                 s.starts_with("c:") && s.contains("users"),
@@ -737,7 +747,7 @@ mod tests {
         // C:\usr — correct, and crucially not U:\sr.
         #[cfg(windows)]
         {
-            let u = resolve_path("/usr/local/lib")
+            let u = resolve_path_here("/usr/local/lib")
                 .to_string_lossy()
                 .to_lowercase();
             assert!(
@@ -750,10 +760,10 @@ mod tests {
         #[cfg(unix)]
         {
             assert_eq!(
-                resolve_path("/usr/local/lib"),
+                resolve_path_here("/usr/local/lib"),
                 PathBuf::from("/usr/local/lib")
             );
-            assert_eq!(resolve_path("/etc/hosts"), PathBuf::from("/etc/hosts"));
+            assert_eq!(resolve_path_here("/etc/hosts"), PathBuf::from("/etc/hosts"));
         }
     }
 
@@ -763,7 +773,7 @@ mod tests {
         // intact, so is_inside said OUTSIDE the project root — a false alarm
         // on the most ordinary delete there is.
         let root = std::env::current_dir().unwrap();
-        let t = resolve_path("./target");
+        let t = resolve_path_here("./target");
         let s = t.to_string_lossy().to_string();
         assert!(
             !s.contains("/./") && !s.contains("\\.\\") && !s.ends_with("/."),
@@ -775,7 +785,7 @@ mod tests {
         );
 
         // `..` climbs out, and must be reported as outside.
-        let up = resolve_path("../sibling");
+        let up = resolve_path_here("../sibling");
         assert!(
             !is_inside(&up, &root),
             "../sibling must be outside the cwd, got {}",
@@ -786,14 +796,14 @@ mod tests {
         // asymmetry that broke it: `target` exists (cargo makes it) so it
         // canonicalized, while `build` does not — and on Windows the two
         // forms are not comparable unless both are normalised first.
-        let b = resolve_path("build");
+        let b = resolve_path_here("build");
         assert!(
             is_inside(&b, &root),
             "a non-existent in-project path must still be inside, got {}",
             b.display()
         );
         assert!(
-            is_inside(&resolve_path("definitely-not-created-yet"), &root),
+            is_inside(&resolve_path_here("definitely-not-created-yet"), &root),
             "existence must not change the inside/outside answer"
         );
     }
@@ -804,12 +814,14 @@ mod tests {
         // resolve identically — the assertion is about quote handling, not
         // about drive conversion.
         assert_eq!(
-            resolve_path("\"/c/tmp\"").to_string_lossy().to_lowercase(),
-            resolve_path("/c/tmp").to_string_lossy().to_lowercase()
+            resolve_path_here("\"/c/tmp\"")
+                .to_string_lossy()
+                .to_lowercase(),
+            resolve_path_here("/c/tmp").to_string_lossy().to_lowercase()
         );
         assert_eq!(
-            resolve_path("'/tmp/x'").to_string_lossy(),
-            resolve_path("/tmp/x").to_string_lossy()
+            resolve_path_here("'/tmp/x'").to_string_lossy(),
+            resolve_path_here("/tmp/x").to_string_lossy()
         );
     }
 
@@ -886,7 +898,7 @@ mod tests {
     use crate::testutil::TestEnv;
 
     fn preview_lines(command: &str, root: Option<&Path>) -> Vec<String> {
-        preview_for(command, root)
+        preview_for(command, root, &std::env::current_dir().unwrap())
             .map(|p| p.lines)
             .unwrap_or_default()
     }
@@ -1024,10 +1036,10 @@ mod tests {
             .expect("a home directory must be set");
         let home = PathBuf::from(home);
 
-        assert_eq!(resolve_path("~"), home);
-        assert_eq!(resolve_path("~/projects"), home.join("projects"));
+        assert_eq!(resolve_path_here("~"), home);
+        assert_eq!(resolve_path_here("~/projects"), home.join("projects"));
         // A path that merely starts with the character is not an expansion.
-        assert_ne!(resolve_path("~notauser"), home.join("notauser"));
+        assert_ne!(resolve_path_here("~notauser"), home.join("notauser"));
     }
 
     /// Sets HOME/USERPROFILE for the life of the guard. Process-global, so

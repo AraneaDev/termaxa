@@ -32,7 +32,7 @@ pub enum Destructive {
 /// `live` gates the catalog query only. Static analysis of the SQL always
 /// runs, so a denied command still gets "DROP users" in its reason string —
 /// it just doesn't cause a connection to the database it was blocked from.
-pub fn preview_for(command: &str, live: bool) -> Option<Preview> {
+pub fn preview_for(command: &str, cwd: &std::path::Path, live: bool) -> Option<Preview> {
     let tokens = shell_tokens(command);
     if tokens.first().map(|t| !t.ends_with("psql") && t != "psql") != Some(false) {
         return None; // not a psql invocation
@@ -147,7 +147,7 @@ pub fn preview_for(command: &str, live: bool) -> Option<Preview> {
         }
     }
 
-    match crate::backup::plan(command) {
+    match crate::backup::plan(command, cwd) {
         Some(plan) => lines.push(format!("  insurance : {} (automatic on run/hook)", plan)),
         None => lines.push("  insurance : none — not reversible without a backup".into()),
     }
@@ -642,8 +642,8 @@ mod tests {
     #[test]
     fn ignores_safe_sql_and_non_psql() {
         assert!(parse_destructive("SELECT * FROM users").is_empty());
-        assert!(preview_for("git push origin main", true).is_none());
-        assert!(preview_for("psql -c 'SELECT 1'", true).is_none());
+        assert!(preview_for("git push origin main", std::path::Path::new("."), true).is_none());
+        assert!(preview_for("psql -c 'SELECT 1'", std::path::Path::new("."), true).is_none());
     }
 
     #[test]
@@ -871,8 +871,10 @@ mod tests {
     fn a_psql_invocation_without_a_statement_has_nothing_to_preview() {
         // extract_sql walks to the end of the token list here, and the bound
         // on that walk is all that separates it from an index panic.
-        assert!(preview_for("psql -d shop", false).is_none());
-        assert!(preview_for("psql -d shop -U app -tAX", false).is_none());
+        assert!(preview_for("psql -d shop", std::path::Path::new("."), false).is_none());
+        assert!(
+            preview_for("psql -d shop -U app -tAX", std::path::Path::new("."), false).is_none()
+        );
     }
 
     #[test]
@@ -988,7 +990,8 @@ mod tests {
             "the dependents decide what a CASCADE would also empty"
         );
 
-        let p = preview_for(&command, true).expect("a truncate is previewable");
+        let p = preview_for(&command, std::path::Path::new("."), true)
+            .expect("a truncate is previewable");
         assert!(
             p.lines.iter().any(|l| l.contains("120,000")),
             "the row estimate is the blast radius: {:?}",
@@ -1011,7 +1014,8 @@ mod tests {
         // With CASCADE the dependents are emptied on purpose, so the warning
         // that the statement will FAIL without it must not appear.
         let with_cascade = format!("{} -d shop -c \"TRUNCATE users CASCADE\"", psql.display());
-        let p = preview_for(&with_cascade, true).expect("a truncate is previewable");
+        let p = preview_for(&with_cascade, std::path::Path::new("."), true)
+            .expect("a truncate is previewable");
         assert!(
             !p.lines.iter().any(|l| l.contains("without CASCADE")),
             "CASCADE was given: {:?}",
@@ -1040,7 +1044,8 @@ mod tests {
 
         assert!(fk_dependents(&command, "users").is_empty());
 
-        let p = preview_for(&command, true).expect("static analysis still applies");
+        let p = preview_for(&command, std::path::Path::new("."), true)
+            .expect("static analysis still applies");
         assert!(
             p.lines.iter().any(|l| l.contains("database unreachable")),
             "{:?}",
@@ -1055,9 +1060,24 @@ mod tests {
 
     #[test]
     fn a_client_that_is_not_psql_is_not_previewed() {
-        assert!(preview_for("mysql -e \"DROP TABLE users\"", false).is_none());
-        assert!(preview_for("psqlx -c \"DROP TABLE users\"", false).is_none());
+        assert!(preview_for(
+            "mysql -e \"DROP TABLE users\"",
+            std::path::Path::new("."),
+            false
+        )
+        .is_none());
+        assert!(preview_for(
+            "psqlx -c \"DROP TABLE users\"",
+            std::path::Path::new("."),
+            false
+        )
+        .is_none());
         // An absolute path to the real client still is one.
-        assert!(preview_for("/usr/bin/psql -c \"DROP TABLE users\"", false).is_some());
+        assert!(preview_for(
+            "/usr/bin/psql -c \"DROP TABLE users\"",
+            std::path::Path::new("."),
+            false
+        )
+        .is_some());
     }
 }
