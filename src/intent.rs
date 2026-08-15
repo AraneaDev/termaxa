@@ -137,8 +137,14 @@ fn classify_segment_named(segment: &str) -> Option<Intent> {
     if toks.is_empty() {
         return None;
     }
-    let lc: Vec<String> = toks.iter().map(|t| t.to_ascii_lowercase()).collect();
-    let first = lc[0].as_str();
+    // The command's real head, past any wrapper, normalized the same way the
+    // delete extractor and the insurance layer normalize it. Reading token
+    // zero raw is what made `sudo rm -rf x`, `/bin/rm -rf x` and
+    // `C:\Windows\System32\del.exe /s /q x` all classify as nothing.
+    let (head, at) = crate::delete::resolve_head(&toks)?;
+    let first = head.as_str();
+    // Arguments begin after the command, which is `at`, not 0.
+    let lc: Vec<String> = toks[at..].iter().map(|t| t.to_ascii_lowercase()).collect();
 
     // --- file deletes: unix rm, PowerShell Remove-Item + aliases, cmd del ---
     // PowerShell aliases: rm, ri, del, erase, rd all map to Remove-Item.
@@ -213,9 +219,19 @@ fn classify_segment_named(segment: &str) -> Option<Intent> {
                 t == "--force" || t == "-f" || t == "--force-with-lease" || t.starts_with('+')
             }),
             "reset" => lc.iter().any(|t| t == "--hard"),
-            "clean" => lc
-                .iter()
-                .any(|t| t.starts_with('-') && !t.starts_with("--") && t.contains('f')),
+            // `git clean` deletes untracked files, and git refuses to do it
+            // without a force flag - so the force flag IS the destructive
+            // signal. Both spellings count. The clustered short form needs
+            // the `!starts_with("--")` guard (a long flag merely CONTAINING
+            // an f, like `--dry-run`, is not `-f`), and that guard was
+            // excluding the legitimate long spelling along with it:
+            // `git clean --force` classified as nothing until v0.16, while
+            // `git clean -f` was caught. One flag, two spellings, one
+            // meaning - the same lesson as decision #47, read the flag, not
+            // the shape of the string.
+            "clean" => lc.iter().any(|t| {
+                t == "--force" || (t.starts_with('-') && !t.starts_with("--") && t.contains('f'))
+            }),
             // -D is case-sensitive: -d only deletes merged branches.
             "branch" => toks.iter().any(|t| t == "-D"),
             _ => false,
@@ -472,6 +488,89 @@ mod tests {
                 "{cmd} destroys a file by writing over it"
             );
         }
+    }
+
+    /// `git clean` deletes untracked files and git refuses without a force
+    /// flag, so the flag is the signal. `--force` was missed while `-f` was
+    /// caught: the guard that stops a long flag merely containing an `f`
+    /// (`--dry-run`) from counting was excluding the real long spelling too.
+    #[test]
+    fn git_clean_counts_both_spellings_of_force() {
+        for cmd in ["git clean -f", "git clean --force", "git clean -fdx"] {
+            assert_eq!(
+                classify_command(cmd),
+                Some(Intent::GitDestructive),
+                "{cmd}: force is force in either spelling"
+            );
+        }
+        // Control legs - git deletes nothing without force, so these are not
+        // destructive, and a long flag containing an `f` must not count.
+        for cmd in [
+            "git clean -n",
+            "git clean --dry-run",
+            "git clean -d",
+            "git clean --interactive",
+        ] {
+            assert_eq!(classify_command(cmd), None, "{cmd} deletes nothing");
+        }
+    }
+
+    /// v0.16: a wrapper program hid the real command from every engine.
+    /// Measured before the fix - each of these classified as `None`, so no
+    /// intent, no breaker pressure, and (via the same head resolution) no
+    /// insurance. The wrapper is not the danger; reading token zero as the
+    /// command was.
+    #[test]
+    fn a_wrapper_does_not_hide_the_command_it_runs() {
+        for cmd in [
+            "sudo rm -rf ./dist",
+            "doas rm -rf /",
+            "env rm -rf ./dist",
+            "env FOO=1 rm -rf ./dist",
+            "sudo -u alice rm -rf ./dist",
+            "nice -n 10 rm -rf x",
+            "nohup rm -rf x",
+            "command rm -rf x",
+        ] {
+            assert_eq!(
+                classify_command(cmd),
+                Some(Intent::FileDelete),
+                "{cmd}: the wrapper must not hide the delete"
+            );
+        }
+        // Not only deletes: a wrapper blanked the WHOLE classifier.
+        assert_eq!(
+            classify_command("sudo terraform destroy -auto-approve"),
+            Some(Intent::InfraDestroy),
+        );
+
+        // Control legs. A wrapper with no command after it names nothing to
+        // judge, and the word only counts in command position - otherwise
+        // `echo sudo rm` would classify as a delete.
+        for cmd in ["sudo", "sudo -u alice", "env FOO=1", "echo sudo rm -rf x"] {
+            assert_eq!(classify_command(cmd), None, "{cmd} must not classify");
+        }
+    }
+
+    /// The head is normalized by path and extension, as `delete.rs` always
+    /// normalized it. These two modules disagreed: the Windows full-path form
+    /// was a recognised delete to the extractor and nothing to the
+    /// classifier, on the platform where every dialect bug has happened.
+    #[test]
+    fn a_path_qualified_command_is_the_command_it_names() {
+        for cmd in [
+            "/bin/rm -rf ./dist",
+            "/usr/bin/rm -rf ./dist",
+            "C:\\Windows\\System32\\del.exe /s /q x",
+        ] {
+            assert_eq!(
+                classify_command(cmd),
+                Some(Intent::FileDelete),
+                "{cmd}: a path-qualified delete is still a delete"
+            );
+        }
+        // Control leg - a path-qualified harmless command stays harmless.
+        assert_eq!(classify_command("/bin/ls -la"), None);
     }
 
     /// Appending does not destroy, descriptor plumbing names no file, and a
@@ -1073,15 +1172,14 @@ mod tests {
         }
     }
 
-    /// KNOWN GAP, pinned so a fix flips it deliberately rather than by
-    /// accident: `git clean -f` is classified and `git clean --force` is not.
-    /// The two spellings delete the same untracked files. The rm predicate a
-    /// few lines above handles its own long form by listing `--force`
-    /// explicitly; this one only reads bundled short flags, so the long
-    /// spelling presses nothing toward the breaker and shows no intent in the
-    /// report.
+    /// GAP CLOSED, v0.16 - this test is the INVERSION its own message asked
+    /// for, not a deletion. It read: "`git clean -f` is classified and
+    /// `git clean --force` is not... if this ever starts classifying, the
+    /// gap was fixed and this test should be inverted rather than deleted."
+    /// It now asserts the fixed behaviour on the same inputs, so the record
+    /// of what was broken survives in the place that proves it is not.
     #[test]
-    fn git_clean_recognises_only_the_short_force_flag() {
+    fn git_clean_was_a_known_gap_and_is_now_closed() {
         assert_eq!(
             classify_command("git clean -f"),
             Some(Intent::GitDestructive)
@@ -1092,9 +1190,8 @@ mod tests {
         );
         assert_eq!(
             classify_command("git clean --force"),
-            None,
-            "if this ever starts classifying, the gap was fixed and this test \
-             should be inverted rather than deleted"
+            Some(Intent::GitDestructive),
+            "the pinned gap: both spellings delete the same untracked files"
         );
         // A dry run destroys nothing either way.
         assert_eq!(classify_command("git clean -n"), None);
