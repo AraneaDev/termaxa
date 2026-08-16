@@ -79,10 +79,23 @@ rules:
   # here: agents write files constantly, and a gate that asks on every redirect
   # is auto-approved into meaninglessness. Insurance without friction is the
   # trade — see #14.
+  #
+  # The two string rules below are kept, and a `match_path` rule now sits with
+  # them. They are not redundant: the string rules read the command as typed,
+  # the path rule reads what the command actually TOUCHES after resolution.
+  # `> .env` and `> ./.env` are the same file and different strings - the
+  # second walked past both string rules for four releases (known-limitations
+  # 0.2, pinned as a test until v0.16). Matching the resolved target closes
+  # every spelling of one path at once, which is what the string rules could
+  # never do by adding more patterns.
   - match: "*> .env*"
     action: deny
     reason: "Overwriting .env destroys credentials that are not in the repo."
   - match: "*>.env*"
+    action: deny
+    reason: "Overwriting .env destroys credentials that are not in the repo."
+  - match: "*.env*"
+    match_path: "*/.env"
     action: deny
     reason: "Overwriting .env destroys credentials that are not in the repo."
   - match: "*> /etc/*"
@@ -621,6 +634,10 @@ pub(crate) fn which(bin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn here() -> crate::resolve::EvalContext {
+        crate::resolve::EvalContext::at(std::path::Path::new("."))
+    }
     use crate::testutil::TempTree;
 
     /// `examples/policy.yaml` is the file people copy. It had drifted to 28
@@ -717,14 +734,15 @@ mod tests {
             "cat .termaxa/policy.yaml > /etc/hosts",
         ] {
             assert_eq!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 crate::policy::Action::Deny,
                 "{cmd} must not be allowed via the .termaxa read exception"
             );
         }
         // The exception itself still works — that is what it is for.
         assert_eq!(
-            p.evaluate_command("cat .termaxa/policy.yaml").action,
+            p.evaluate_command("cat .termaxa/policy.yaml", &here())
+                .action,
             crate::policy::Action::Allow
         );
     }
@@ -740,7 +758,7 @@ mod tests {
             "mkfs.ext4 /dev/sdb1",
         ] {
             assert_eq!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 crate::policy::Action::Deny,
                 "{cmd} has no recovery path and must deny, not ask"
             );
@@ -890,7 +908,7 @@ mod tests {
             "git status & rm -rf /",
         ] {
             assert_ne!(
-                p.evaluate_command(cmd).action,
+                p.evaluate_command(cmd, &here()).action,
                 crate::policy::Action::Allow,
                 "{cmd} is still allowed"
             );
